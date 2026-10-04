@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>9.0</LangVersion>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="../Editor/SourceCatalog.cs" Link="SourceCatalog.cs" />
+    <Compile Include="../Editor/RecoveryPipeline.cs" Link="RecoveryPipeline.cs" />
+    <Compile Include="../Editor/RecoveryModels.cs" Link="RecoveryModels.cs" Condition="Exists('../Editor/RecoveryModels.cs')" />
+    <Compile Include="../Editor/AssetRipperBackend.cs" Link="AssetRipperBackend.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(NewtonsoftJsonPath)' != ''">
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(NewtonsoftJsonPath)</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(NewtonsoftJsonPath)' == ''">
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+</Project>

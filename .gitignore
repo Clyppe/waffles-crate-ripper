@@ -1,0 +1,13 @@
+Library/
+Temp/
+Logs/
+obj/
+bin/
+.DS_Store
+*.user
+TestResults*.xml
+test-results/
+local-validation/
+backend/
+*.zip
+*.bundle

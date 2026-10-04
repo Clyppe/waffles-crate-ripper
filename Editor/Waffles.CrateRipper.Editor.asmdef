@@ -1,0 +1,7 @@
+{
+  "name": "Waffles.CrateRipper.Editor",
+  "rootNamespace": "Waffles.CrateRipper",
+  "references": ["Unity.Newtonsoft.Json"],
+  "includePlatforms": ["Editor"],
+  "autoReferenced": true
+}

@@ -1,0 +1,12 @@
+{
+  "name": "com.clyppe.crate-ripper",
+  "version": "1.0.0",
+  "displayName": "Waffles Crate Ripper",
+  "description": "Recover BONELAB crate and mod assets, reconnect installed SDK scripts, and inspect import reports inside Unity.",
+  "unity": "2021.3",
+  "author": { "name": "Clyppe" },
+  "repository": { "type": "git", "url": "https://github.com/Clyppe/waffles-crate-ripper.git" },
+  "license": "MIT",
+  "dependencies": { "com.unity.nuget.newtonsoft-json": "3.0.2" },
+  "keywords": ["bonelab", "marrow", "assetbundle", "editor"]
+}
