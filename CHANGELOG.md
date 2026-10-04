@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2 — 2026-10-03
+
+- Resolve and stage only the selected crate's recursive bundle dependencies before running AssetRipper, instead of loading the entire BONELAB or pallet folder.
+- Resolve each dependency through its own pallet location, including unregistered pallets supplied in ZIPs.
+- Stop selected-crate extraction when catalogs or dependency bundles are missing, without a whole-folder fallback.
+- Import only streaming resources owned or referenced by selected assets; exclude unrelated sidecars.
+- Install Addressables automatically for catalog decoding and add crate-isolation regression checks.
+
 ## 1.0.1 — 2026-10-03
 
 - Replaced the generic object field with a searchable picker populated from Marrow's Asset Warehouse and project crate assets.

@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using UnityEditor;
 using UnityEngine;
 using Object = UnityEngine.Object;
@@ -95,6 +96,7 @@ namespace Waffles.CrateRipper
             return new CrateEntry {
                 Name = title, Barcode = Member(obj, "Barcode")?.ToString() ?? "", MainAssetGuid = guid ?? "",
                 Kind = obj.GetType().Name, PalletName = Member(Member(obj, "Pallet"), "Title") as string ?? "Project",
+                PalletBarcode = Member(Member(obj, "Pallet"), "Barcode")?.ToString() ?? "",
                 LocalPrefabPath = path, OriginalAssetPath = path
             };
         }
@@ -168,6 +170,7 @@ namespace Waffles.CrateRipper
                             if (palletBarcode != null && manifests.TryGetValue(palletBarcode, out var manifest))
                             {
                                 crate.SourceFolder = ManifestFolder(manifest);
+                                crate.SourceRoot = crate.SourceFolder;
                                 var original = CatalogPrefab(Member(manifest, "Catalog"), crate.MainAssetGuid);
                                 if (!string.IsNullOrEmpty(original)) crate.OriginalAssetPath = original;
                             }
@@ -197,6 +200,8 @@ namespace Waffles.CrateRipper
             var preferred = !string.IsNullOrEmpty(entry.LocalPrefabPath) && string.IsNullOrEmpty(previous.LocalPrefabPath) ? entry : previous;
             var other = preferred == entry ? previous : entry;
             if (string.IsNullOrEmpty(preferred.SourceFolder)) preferred.SourceFolder = other.SourceFolder;
+            if (string.IsNullOrEmpty(preferred.SourceRoot)) preferred.SourceRoot = other.SourceRoot;
+            if (string.IsNullOrEmpty(preferred.PalletBarcode)) preferred.PalletBarcode = other.PalletBarcode;
             if (string.IsNullOrEmpty(preferred.OriginalAssetPath)) preferred.OriginalAssetPath = other.OriginalAssetPath;
             entries[key] = preferred;
         }
@@ -236,6 +241,195 @@ namespace Waffles.CrateRipper
             }
             catch (Exception) { }
             return null;
+        }
+
+        private sealed class LocationIdentity : IEqualityComparer<object>
+        {
+            public new bool Equals(object a, object b) { return ReferenceEquals(a, b); }
+            public int GetHashCode(object value) { return RuntimeHelpers.GetHashCode(value); }
+        }
+
+        // Resolve from this crate's root locations only. Never iterate locator.Keys
+        // or substitute the entire game's/pallet's directory as extractor input.
+        internal static List<string> BundleFiles(CrateEntry crate)
+        {
+            if (crate == null || string.IsNullOrEmpty(crate.MainAssetGuid))
+                throw new InvalidOperationException("The selected crate has no main asset GUID.");
+            var sourceFolders = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            var warehouseLocators = new List<object>();
+            var locators = new List<object>();
+            var warehouse = WarehouseInstance(WarehouseType());
+            if (Query(warehouse, "GetPalletManifests") is IEnumerable manifests)
+                foreach (var manifest in manifests)
+                {
+                    var barcode = Member(manifest, "PalletBarcode")?.ToString()
+                        ?? Member(Member(manifest, "Pallet"), "Barcode")?.ToString();
+                    var folder = ManifestFolder(manifest);
+                    if (!string.IsNullOrEmpty(barcode) && !string.IsNullOrEmpty(folder)) sourceFolders[barcode] = new List<string> { folder };
+                    var locator = Member(manifest, "Catalog");
+                    if (locator != null && ((!string.IsNullOrEmpty(crate.PalletBarcode) && barcode == crate.PalletBarcode)
+                        || (string.IsNullOrEmpty(crate.PalletBarcode) && string.Equals(folder, crate.SourceFolder, StringComparison.OrdinalIgnoreCase))))
+                        warehouseLocators.Add(locator);
+                }
+
+            // Unregistered ZIP pallets have no warehouse path resolver. Explicit
+            // barcode mappings also resolve dependencies between pallets in a ZIP.
+            var root = !string.IsNullOrEmpty(crate.SourceRoot) ? crate.SourceRoot : crate.SourceFolder;
+            if (!string.IsNullOrEmpty(root) && Directory.Exists(root))
+                foreach (var entry in SourceCatalog.ReadPalletFolders(root)) sourceFolders[entry.Key] = entry.Value;
+            if (!string.IsNullOrEmpty(crate.PalletBarcode) && !string.IsNullOrEmpty(crate.SourceFolder))
+                sourceFolders[crate.PalletBarcode] = new List<string> { crate.SourceFolder };
+
+            var catalogType = AppDomain.CurrentDomain.GetAssemblies()
+                .Select(a => a.GetType("UnityEngine.AddressableAssets.ResourceLocators.ContentCatalogData", false)).FirstOrDefault(t => t != null);
+            var catalogErrors = new List<string>();
+            var catalogPaths = !string.IsNullOrEmpty(crate.SourceFolder) && Directory.Exists(crate.SourceFolder)
+                ? Directory.GetFiles(crate.SourceFolder, "catalog*.json", SearchOption.TopDirectoryOnly).OrderBy(p => p, StringComparer.Ordinal).ToArray()
+                : new string[0];
+            if (catalogType != null)
+                foreach (var path in catalogPaths)
+                {
+                    try
+                    {
+                        var data = JsonUtility.FromJson(File.ReadAllText(path), catalogType);
+                        var locator = catalogType.GetMethod("CreateLocator", new[] { typeof(string) })?.Invoke(data, new object[] { null });
+                        if (locator != null) locators.Add(locator);
+                    }
+                    catch (Exception ex) { catalogErrors.Add(Path.GetFileName(path) + ": " + ex.GetBaseException().Message); }
+                }
+            // Once this source supplies catalogs, a missing or invalid root must
+            // not silently fall back to an older installed copy of the pallet.
+            if (catalogPaths.Length == 0) locators.AddRange(warehouseLocators);
+
+            List<object> roots = null;
+            foreach (var locator in locators)
+            {
+                roots = Locate(locator, crate.MainAssetGuid);
+                if (roots.Count > 0) break;
+            }
+            if (roots == null || roots.Count == 0)
+                throw new InvalidOperationException("Cannot resolve the selected crate's bundle dependencies from its catalog. " +
+                    "Load its complete mod ZIP or pallet folder and ensure Addressables is installed. " + string.Join("; ", catalogErrors));
+            var prefab = roots.Select(location => Member(location, "InternalId") as string)
+                .FirstOrDefault(id => !string.IsNullOrEmpty(id) && id.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrEmpty(prefab)) crate.OriginalAssetPath = prefab.Replace('\\', '/');
+
+            var pending = new Queue<object>(roots);
+            var visited = new HashSet<object>(new LocationIdentity());
+            var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var missing = new List<string>();
+            while (pending.Count > 0)
+            {
+                var location = pending.Dequeue();
+                if (location == null || !visited.Add(location)) continue;
+                if (Member(location, "Dependencies") is IEnumerable dependencies)
+                    foreach (var dependency in dependencies) if (dependency != null) pending.Enqueue(dependency);
+                var id = Member(location, "InternalId") as string;
+                var provider = Member(location, "ProviderId") as string ?? "";
+                var resourceType = Member(location, "ResourceType") as Type;
+                bool isBundle = provider.IndexOf("AssetBundleProvider", StringComparison.OrdinalIgnoreCase) >= 0
+                    || resourceType?.Name == "IAssetBundleResource" || resourceType == typeof(AssetBundle)
+                    || (!string.IsNullOrEmpty(id) && id.EndsWith(".bundle", StringComparison.OrdinalIgnoreCase));
+                if (!isBundle) continue;
+                var file = BundleFile(location, id, crate.SourceFolder, sourceFolders);
+                if (file == null) missing.Add(id ?? "Unnamed bundle dependency");
+                else files.Add(file);
+            }
+            if (missing.Count > 0)
+                throw new FileNotFoundException("Selected crate dependency bundles are missing. Supply those pallet files before extraction:\n" + string.Join("\n", missing.Distinct()));
+            if (files.Count == 0)
+                throw new InvalidOperationException("The catalog contains no asset bundles for the selected crate. Extraction was stopped.");
+            return files.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private static List<object> Locate(object locator, string guid)
+        {
+            try
+            {
+                var locate = locator.GetType().GetMethods().FirstOrDefault(m => m.Name == "Locate" && m.GetParameters().Length == 3);
+                if (locate == null) return new List<object>();
+                var args = new object[] { guid, null, null };
+                if (!(bool)locate.Invoke(locator, args) || !(args[2] is IEnumerable locations)) return new List<object>();
+                return locations.Cast<object>().ToList();
+            }
+            catch (Exception) { return new List<object>(); }
+        }
+
+        private static string BundleFile(object location, string id, string selectedFolder, Dictionary<string, List<string>> palletFolders)
+        {
+            if (string.IsNullOrEmpty(id)) return null;
+            if (id.StartsWith("PALLET_BARCODE:", StringComparison.Ordinal))
+            {
+                int split = id.IndexOf(':', "PALLET_BARCODE:".Length);
+                if (split > 0)
+                {
+                    var barcode = id.Substring("PALLET_BARCODE:".Length, split - "PALLET_BARCODE:".Length);
+                    if (palletFolders.TryGetValue(barcode, out var folders))
+                    {
+                        var relative = id.Substring(split + 1).TrimStart('/', '\\').Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+                        var matches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var folder in folders)
+                        {
+                            var root = Path.GetFullPath(folder);
+                            var path = Path.GetFullPath(Path.Combine(root, relative));
+                            if (!path.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                                throw new InvalidDataException("A bundle dependency leaves its pallet folder: " + id);
+                            var mapped = ExistingBundle(path);
+                            if (mapped != null) matches.Add(mapped);
+                        }
+                        if (matches.Count > 1)
+                            throw new InvalidDataException("Multiple copies of a required bundle were found. Load the folder for one platform/build: " + id + "\n" + string.Join("\n", matches));
+                        // Known source mappings are authoritative. A missing ZIP
+                        // file must not be replaced by an older installed bundle.
+                        return matches.SingleOrDefault();
+                    }
+                }
+                // The dependency belongs to its own pallet. Never guess that it
+                // resides in the selected crate's directory when the mapping is absent.
+            }
+            else
+            {
+                if (Path.IsPathRooted(id) || Uri.TryCreate(id, UriKind.Absolute, out _))
+                {
+                    var direct = ExistingBundle(id);
+                    if (direct != null) return direct;
+                }
+                else if (!string.IsNullOrEmpty(selectedFolder) && id.IndexOf('{') < 0 && id.IndexOf('[') < 0)
+                {
+                    var root = Path.GetFullPath(selectedFolder);
+                    var path = Path.GetFullPath(Path.Combine(root, id.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar)));
+                    if (!path.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidDataException("A bundle dependency leaves its selected source folder: " + id);
+                    return ExistingBundle(path);
+                }
+            }
+            // Marrow's transformer handles cross-pallet game paths and other
+            // Addressables runtime substitutions using the dependency's manifest.
+            try
+            {
+                var addressables = AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("UnityEngine.AddressableAssets.Addressables", false)).FirstOrDefault(t => t != null);
+                var manager = addressables?.GetProperty("ResourceManager", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+                var transform = manager?.GetType().GetMethods().FirstOrDefault(m => m.Name == "TransformInternalId" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType.IsInstanceOfType(location));
+                var transformed = transform?.Invoke(manager, new[] { location }) as string;
+                return ExistingBundle(transformed);
+            }
+            catch (Exception) { return null; }
+        }
+
+        private static string ExistingBundle(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            try
+            {
+                if (Uri.TryCreate(path, UriKind.Absolute, out var uri))
+                {
+                    if (!uri.IsFile) return null;
+                    path = uri.LocalPath;
+                }
+                return File.Exists(path) ? Path.GetFullPath(path) : null;
+            }
+            catch (ArgumentException) { return null; }
+            catch (NotSupportedException) { return null; }
         }
 
         internal static void ResolveCatalogPaths(IEnumerable<CrateEntry> crates, Action<string> status)

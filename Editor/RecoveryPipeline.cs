@@ -310,9 +310,6 @@ namespace Waffles.CrateRipper
             var chosen = new HashSet<SourceAsset>();
             var queue = new Queue<SourceAsset>();
             queue.Enqueue(first);
-            // Streaming payloads do not necessarily have GUID references. Retain all
-            // exported resource sidecars so linked binary data remains available.
-            foreach (var asset in all.Where(a => !a.IsFolder && SidecarExtensions.Contains(Path.GetExtension(a.Relative)))) queue.Enqueue(asset);
             while (queue.Count != 0)
             {
                 cancellation.ThrowIfCancellationRequested();
@@ -327,7 +324,7 @@ namespace Waffles.CrateRipper
                         if (byGuid.TryGetValue(match.Groups[1].Value, out dependency)) queue.Enqueue(dependency);
                     }
                 }
-                AddRelativeSidecars(asset, byPath, queue);
+                AddRelativeSidecars(asset, byPath, queue, report);
             }
             // Keep importer folder settings along the selected dependency paths.
             foreach (var asset in chosen.ToList())
@@ -344,30 +341,119 @@ namespace Waffles.CrateRipper
             return chosen;
         }
 
-        private static void AddRelativeSidecars(SourceAsset asset, Dictionary<string, SourceAsset> byPath, Queue<SourceAsset> queue)
+        private static void AddRelativeSidecars(SourceAsset asset, Dictionary<string, SourceAsset> byPath, Queue<SourceAsset> queue,
+            RecoveryReport report)
         {
-            if (asset.Text == null || asset.IsFolder) return;
+            if (asset.IsFolder) return;
+            // A binary payload is a dependency of its owning asset, not of every
+            // crate in an export. Prefix matching is limited to the exact sibling
+            // name (Albedo.png.resS), never an entire directory or extension.
+            foreach (var extension in SidecarExtensions)
+            {
+                SourceAsset companion;
+                if (byPath.TryGetValue(asset.Relative + extension, out companion)) queue.Enqueue(companion);
+            }
             // glTF buffers/textures and shader include files are paths rather than GUIDs.
-            var expressions = new[] { @"""uri""\s*:\s*""([^""]+)""", @"#\s*include(?:_with_pragmas)?\s*""([^""]+)""" };
+            // These grammars must not be applied to arbitrary TextAsset content.
+            var assetExtension = Path.GetExtension(asset.Relative);
+            var expressions = new List<string>();
+            if (assetExtension.Equals(".gltf", StringComparison.OrdinalIgnoreCase)) expressions.Add(@"""uri""\s*:\s*""([^""]+)""");
+            if (new[] { ".shader", ".hlsl", ".cginc", ".compute", ".glsl" }.Contains(assetExtension, StringComparer.OrdinalIgnoreCase))
+                expressions.Add(@"#\s*include(?:_with_pragmas)?\s*""([^""]+)""");
             foreach (var expression in expressions)
             {
+                if (asset.Text == null) continue;
                 foreach (Match match in Regex.Matches(asset.Text.Value, expression))
                 {
-                    var linked = match.Groups[1].Value;
-                    if (linked.IndexOf(':') >= 0 || linked.StartsWith("/", StringComparison.Ordinal)) continue;
-                    var segments = (Slash(Path.GetDirectoryName(asset.Relative) ?? "") + "/" + Slash(linked)).Split('/');
-                    var stack = new List<string>();
-                    var invalid = false;
-                    foreach (var segment in segments)
-                    {
-                        if (segment.Length == 0 || segment == ".") continue;
-                        if (segment == "..") { if (stack.Count == 0) { invalid = true; break; } stack.RemoveAt(stack.Count - 1); }
-                        else stack.Add(segment);
-                    }
                     SourceAsset dependency;
-                    if (!invalid && byPath.TryGetValue(string.Join("/", stack), out dependency)) queue.Enqueue(dependency);
+                    if (TryRelativeDependency(asset.Relative, match.Groups[1].Value, byPath, out dependency)) queue.Enqueue(dependency);
                 }
             }
+            // Texture, mesh and audio StreamingInfo fields may use a plain path
+            // rather than a GUID, including archive:/CAB-name/payload.resS.
+            foreach (var contents in new[] { asset.Text == null || !IsYaml(asset.Text.Value) ? null : asset.Text.Value,
+                asset.Meta == null ? null : asset.Meta.Value })
+            {
+                if (contents == null) continue;
+                foreach (var linked in StreamingPaths(contents))
+                {
+                    if (linked.Length == 0 || !SidecarExtensions.Contains(Path.GetExtension(linked))) continue;
+                    SourceAsset dependency;
+                    if (TryStreamingDependency(asset.Relative, linked, byPath, out dependency)) queue.Enqueue(dependency);
+                    else
+                    {
+                        AddUnique(report.missingAssetReferences, "Streaming resource " + linked + " — " + asset.Relative);
+                        AddUnique(report.warnings, "Missing streaming resource " + linked + " referenced by " + asset.Relative + ". Unrelated export payloads were not substituted.");
+                    }
+                }
+            }
+        }
+
+        private static IEnumerable<string> StreamingPaths(string contents)
+        {
+            var pathExpression = @"\b(?:path|m_Path|m_Source|source|m_ResourcePath)[ \t]*:[ \t]*(""(?:[^""\\]|\\.)*""|'(?:[^']|'')*'|[^,}\r\n]*)";
+            var lines = contents.Replace("\r\n", "\n").Split('\n');
+            for (var index = 0; index < lines.Length; index++)
+            {
+                var header = Regex.Match(lines[index], @"^([ \t]*)(?:m_StreamData|m_StreamingInfo|_streamingInfo|streamingInfo|StreamingInfo|m_Resource|m_StreamingResource|m_StreamingData)[ \t]*:[ \t]*(.*)$");
+                if (!header.Success) continue;
+                var body = new StringBuilder(header.Groups[2].Value);
+                if (header.Groups[2].Value.Trim().Length == 0)
+                {
+                    var indent = header.Groups[1].Value.Length;
+                    for (var next = index + 1; next < lines.Length; next++)
+                    {
+                        if (lines[next].Trim().Length == 0) continue;
+                        var leading = lines[next].TakeWhile(c => c == ' ' || c == '\t').Count();
+                        if (leading <= indent) break;
+                        body.Append('\n').Append(lines[next]);
+                    }
+                }
+                foreach (Match path in Regex.Matches(body.ToString(), pathExpression))
+                    yield return path.Groups[1].Value.Trim().Trim('"', '\'');
+            }
+            // Legacy AudioClip YAML can put the resource source directly on the
+            // component instead of nesting it under m_Resource.
+            foreach (var block in SplitDocuments(contents))
+            {
+                if (!Regex.IsMatch(block, @"(?m)^AudioClip:[ \t]*$")) continue;
+                foreach (Match source in Regex.Matches(block, @"(?m)^[ \t]+m_Source[ \t]*:[ \t]*([^\r\n]*)"))
+                    yield return source.Groups[1].Value.Trim().Trim('"', '\'');
+            }
+        }
+
+        private static bool TryRelativeDependency(string owner, string linked, Dictionary<string, SourceAsset> byPath,
+            out SourceAsset dependency)
+        {
+            dependency = null;
+            if (linked.IndexOf(':') >= 0 || Slash(linked).StartsWith("/", StringComparison.Ordinal)) return false;
+            var segments = (Slash(Path.GetDirectoryName(owner) ?? "") + "/" + Slash(linked)).Split('/');
+            var stack = new List<string>();
+            foreach (var segment in segments)
+            {
+                if (segment.Length == 0 || segment == ".") continue;
+                if (segment == "..") { if (stack.Count == 0) return false; stack.RemoveAt(stack.Count - 1); }
+                else stack.Add(segment);
+            }
+            return byPath.TryGetValue(string.Join("/", stack), out dependency) && !dependency.IsFolder;
+        }
+
+        private static bool TryStreamingDependency(string owner, string linked, Dictionary<string, SourceAsset> byPath,
+            out SourceAsset dependency)
+        {
+            if (TryRelativeDependency(owner, linked, byPath, out dependency)) return true;
+            var normalized = Slash(linked);
+            if (normalized.StartsWith("archive:/", StringComparison.OrdinalIgnoreCase)) normalized = normalized.Substring("archive:/".Length).TrimStart('/');
+            else if (normalized.StartsWith("Assets/", StringComparison.Ordinal)) normalized = normalized.Substring("Assets/".Length);
+            else if (normalized.IndexOf(':') >= 0 || normalized.StartsWith("/", StringComparison.Ordinal)) return false;
+            if (normalized.Split('/').Any(segment => segment == ".." || segment == "." || segment.Length == 0)) return false;
+            if (byPath.TryGetValue(normalized, out dependency) && !dependency.IsFolder) return true;
+            // Exporters sometimes flatten archive virtual paths. Use the basename
+            // only if it identifies one file; never select every possible match.
+            var fileName = Path.GetFileName(normalized);
+            var matches = byPath.Values.Where(a => !a.IsFolder && string.Equals(Path.GetFileName(a.Relative), fileName, StringComparison.OrdinalIgnoreCase)).Take(2).ToList();
+            dependency = matches.Count == 1 ? matches[0] : null;
+            return dependency != null;
         }
 
         private static Dictionary<string, ScriptBinding> ScriptIndex(IDictionary<string, ScriptBinding> values, RecoveryReport report)

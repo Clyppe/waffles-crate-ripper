@@ -13,6 +13,7 @@
     <Compile Include="../Editor/RecoveryPipeline.cs" Link="RecoveryPipeline.cs" />
     <Compile Include="../Editor/RecoveryModels.cs" Link="RecoveryModels.cs" Condition="Exists('../Editor/RecoveryModels.cs')" />
     <Compile Include="../Editor/AssetRipperBackend.cs" Link="AssetRipperBackend.cs" />
+    <Compile Include="../Editor/BundleStaging.cs" Link="BundleStaging.cs" />
   </ItemGroup>
   <ItemGroup Condition="'$(NewtonsoftJsonPath)' != ''">
     <Reference Include="Newtonsoft.Json">

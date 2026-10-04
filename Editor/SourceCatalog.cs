@@ -17,7 +17,9 @@ namespace Waffles.CrateRipper
         public string Kind;
         public string MainAssetGuid;
         public string PalletName;
+        public string PalletBarcode;
         public string SourceFolder;
+        public string SourceRoot;
         public string OriginalAssetPath;
         public string LocalPrefabPath;
         public override string ToString() { return Name + " (" + PalletName + ")"; }
@@ -25,6 +27,23 @@ namespace Waffles.CrateRipper
 
     public static class SourceCatalog
     {
+        public static Dictionary<string, List<string>> ReadPalletFolders(string folder)
+        {
+            var result = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (var path in Directory.EnumerateFiles(folder, "*.pallet.json", SearchOption.AllDirectories).OrderBy(p => p, StringComparer.Ordinal))
+            {
+                var document = JObject.Parse(File.ReadAllText(path));
+                var rootRef = (string)document["root"]?["ref"];
+                var pallet = rootRef == null ? null : document["objects"]?[rootRef];
+                var barcode = (string)pallet?["barcode"];
+                if (string.IsNullOrEmpty(barcode)) continue;
+                if (!result.TryGetValue(barcode, out var folders)) result[barcode] = folders = new List<string>();
+                var full = Path.GetFullPath(Path.GetDirectoryName(path));
+                if (!folders.Contains(full, StringComparer.OrdinalIgnoreCase)) folders.Add(full);
+            }
+            return result;
+        }
+
         public static List<CrateEntry> ReadPallets(string folder)
         {
             var result = new List<CrateEntry>();
@@ -46,7 +65,8 @@ namespace Waffles.CrateRipper
                         Barcode = (string)crate["barcode"] ?? "",
                         Kind = kind, MainAssetGuid = (string)crate["mainAsset"] ?? "",
                         PalletName = (string)pallet["title"] ?? Path.GetFileName(Path.GetDirectoryName(path)),
-                        SourceFolder = Path.GetDirectoryName(path)
+                        PalletBarcode = (string)pallet["barcode"] ?? "",
+                        SourceFolder = Path.GetDirectoryName(path), SourceRoot = Path.GetFullPath(folder)
                     });
                 }
             }

@@ -251,7 +251,14 @@ namespace Waffles.CrateRipper
             else
             {
                 if (!File.Exists(backend)) throw new InvalidOperationException("Download or select AssetRipper first.");
-                var input = wholeMod ? sourceFolder : crate.SourceFolder;
+                var input = sourceFolder;
+                if (!wholeMod)
+                {
+                    SetStatus("Resolving the selected crate's bundle dependencies...");
+                    var files = UnityBindings.BundleFiles(crate);
+                    input = await Task.Run(() => BundleStaging.Stage(files, Path.Combine(job, "SelectedBundles"), token, progress), token);
+                    SetStatus("Extracting " + files.Count + " bundles belonging to the selected crate and its dependencies...");
+                }
                 if (string.IsNullOrEmpty(input)) throw new InvalidOperationException("Load the mod folder or ZIP containing this crate first.");
                 assets = await AssetRipperBackend.ExportAsync(backend, input, Path.Combine(job, "Export"), progress, token);
                 token.ThrowIfCancellationRequested();

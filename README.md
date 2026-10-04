@@ -11,13 +11,13 @@ Unity **2021.3 or newer**, Windows x64. The Marrow SDK is recommended for reconn
 3. Paste:
 
    ```text
-   https://github.com/Clyppe/waffles-crate-ripper.git#v1.0.1
+   https://github.com/Clyppe/waffles-crate-ripper.git#v1.0.2
    ```
 
 4. Open **Tools â†’ Waffles â†’ Crate Ripper**.
 5. For packed mods, click **Download official AssetRipper 2.0.0** once. The release is verified against its SHA-256 checksum and stored under your project's `Library/CrateRipper/Backend` folder. You can also select an existing compatible AssetRipper executable.
 
-The tool contains Editor code only. It adds no runtime components to your mod. Unity installs the Newtonsoft JSON package dependency automatically.
+The tool contains Editor code only. It adds no runtime components to your mod. Unity installs the Newtonsoft JSON and Addressables package dependencies automatically.
 
 ## Rip one crate
 
@@ -25,9 +25,11 @@ The tool contains Editor code only. It adds no runtime components to your mod. U
 - For a packed mod, choose **Load mod ZIP** or **Load mod folder**, then pick a crate from the searchable list. Loading your BONELAB `Mods` folder indexes its pallets too.
 - Click **Rip selected crate**.
 
-The output is `Assets/Ripped Crates/<crate name>`. Existing output folders get a numbered suffix. The import includes the selected prefab's referenced meshes, textures, materials, animation, audio and other recoverable assets.
+The output is `Assets/Ripped Crates/<crate name>`. Existing output folders get a numbered suffix. The import includes the selected prefab's referenced meshes, textures, materials, animation, audio and other recoverable assets. Streaming files are included only when owned or referenced by a selected asset.
 
-For warehouse crates, the tool uses the pallet's registered bundle folder and catalog automatically. Project crates use their authored prefab directly. For ZIP/folder sources, the installed Addressables package maps the crate's original asset GUID to its prefab path. If the catalog cannot identify a unique root prefab, the tool shows the recovered prefab list so you can select the correct one before importing. Clear **Spawnables only** to see other crate types; individual extraction requires a prefab, while full-mod extraction includes scenes.
+For packed crates, the tool starts at the selected crate's main asset GUID in its Addressables catalog and follows that asset's bundle dependencies. Only those bundle files are staged for AssetRipper, including required files from other pallets. Missing catalogs or dependency bundles stop extraction with an error; selected-crate extraction never falls back to processing the whole game or pallet folder. Warehouse crates use their registered catalogs and pallet locations automatically. ZIP/folder sources use their packaged catalogs, while project crates use their authored prefab directly.
+
+If the exported prefab cannot be matched uniquely, the tool shows the recovered prefab list so you can select the correct one before importing. Clear **Spawnables only** to see other crate types; individual extraction requires a prefab, while full-mod extraction includes scenes.
 
 ## Rip a whole ZIP or mod
 
@@ -62,6 +64,7 @@ Use the tool with assets you own or are allowed to recover. Extracted assets sta
 ## Implementation and validation
 
 - Official [AssetRipper](https://github.com/AssetRipper/AssetRipper) 2.0.0 is launched as an owned, temporary loopback server. Imports and exports use its local backend routes.
+- Selected-crate operations stage only the root asset's recursive bundle dependency set; whole-mod operations require the separate **Rip entire mod / ZIP** action.
 - AssetRipper exports into a fresh empty staging folder, and never receives the project's `Assets` folder as an export target.
 - ZIP extraction rejects traversal, duplicate paths, links, oversized archives and file/folder aliases.
 - Cancellation closes the backend process started by this operation.
