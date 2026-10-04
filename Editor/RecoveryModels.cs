@@ -12,6 +12,9 @@ namespace Waffles.CrateRipper
     public sealed class ShaderBinding
     {
         public string Name;
+        // Name stays the exported shader identity. ReplacementName describes an
+        // explicitly selected compatible installed shader, when it differs.
+        public string ReplacementName;
         public string Guid;
         public long FileId;
     }

@@ -134,6 +134,14 @@ namespace Waffles.CrateRipper
                 {
                     shaderBindings[asset.Guid] = shader;
                     report.reusedShaders++;
+                    if (!string.IsNullOrEmpty(shader.ReplacementName) && !string.Equals(asset.ShaderName, shader.ReplacementName, StringComparison.Ordinal))
+                    {
+                        var limitation = asset.ShaderName == "SLZ/LitMAS/LitMAS MonoSH" || asset.ShaderName == "Shader Graphs/BakeryURPMonoSHSpecGraphMAS"
+                            ? " Baked MonoSH/Bakery lighting is not reconstructed by this compatibility replacement."
+                            : " The replacement preserves material properties but does not reconstruct the original shader implementation.";
+                        AddUnique(report.warnings, "Shader compatibility replacement: " + asset.ShaderName + " -> " + shader.ReplacementName +
+                            ". Exported shader source is retained as text; serialized textures and material properties are preserved." + limitation);
+                    }
                 }
                 else if (!asset.IsCode && !asset.IsBinarySerialized && !string.IsNullOrEmpty(asset.Guid))
                     freshGuids[asset.Guid] = System.Guid.NewGuid().ToString("N");

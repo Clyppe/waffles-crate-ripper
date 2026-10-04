@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using Newtonsoft.Json;
 
@@ -31,37 +33,40 @@ namespace Waffles.CrateRipper
                 throw new IOException("The staging folder already contains files: " + destination);
 
             var uniquePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var names = new Dictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
+            var entriesByPath = new Dictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
             foreach (var selected in files)
             {
                 cancellation.ThrowIfCancellationRequested();
                 if (string.IsNullOrWhiteSpace(selected)) throw new ArgumentException("A selected bundle path is empty.", nameof(files));
                 var full = Path.GetFullPath(selected);
-                AddFile(full, uniquePaths, names);
+                AddFile(full, uniquePaths, entriesByPath);
                 foreach (var extension in OwnSidecars)
                 {
                     var companion = full + extension;
-                    if (File.Exists(companion)) AddFile(companion, uniquePaths, names);
+                    if (File.Exists(companion)) AddFile(companion, uniquePaths, entriesByPath);
                 }
             }
-            if (names.Count == 0) throw new ArgumentException("Select at least one bundle or dependency file.", nameof(files));
+            if (entriesByPath.Count == 0) throw new ArgumentException("Select at least one bundle or dependency file.", nameof(files));
+            AssignStagedPaths(entriesByPath.Values);
 
             var temporary = destination.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + ".staging-" + Guid.NewGuid().ToString("N");
-            if (names.Values.Any(entry => IsInside(temporary, entry.sourcePath) || IsInside(destination, entry.sourcePath)))
+            if (entriesByPath.Values.Any(entry => IsInside(temporary, entry.sourcePath) || IsInside(destination, entry.sourcePath)))
                 throw new IOException("Selected source files cannot be inside the staging output.");
             AssertSafeParents(temporary);
             Directory.CreateDirectory(temporary);
             try
             {
-                var entries = names.Values.OrderBy(entry => entry.filename, StringComparer.Ordinal).ToList();
+                var entries = entriesByPath.Values.OrderBy(entry => entry.filename, StringComparer.Ordinal).ToList();
                 foreach (var entry in entries)
                 {
                     cancellation.ThrowIfCancellationRequested();
                     progress?.Report("Staging " + entry.filename);
+                    var stagedPath = Path.Combine(temporary, entry.filename);
+                    Directory.CreateDirectory(Path.GetDirectoryName(stagedPath));
                     // Chunked copies make Cancel responsive even for large bundles.
                     var buffer = new byte[128 * 1024];
                     using (var input = new FileStream(entry.sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                    using (var output = new FileStream(Path.Combine(temporary, entry.filename), FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    using (var output = new FileStream(stagedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     {
                         int count;
                         while ((count = input.Read(buffer, 0, buffer.Length)) != 0)
@@ -99,7 +104,7 @@ namespace Waffles.CrateRipper
             }
         }
 
-        private static void AddFile(string source, HashSet<string> uniquePaths, Dictionary<string, Entry> names)
+        private static void AddFile(string source, HashSet<string> uniquePaths, Dictionary<string, Entry> entriesByPath)
         {
             if (!File.Exists(source)) throw new FileNotFoundException("Selected dependency file does not exist.", source);
             AssertSafeParents(source);
@@ -107,10 +112,39 @@ namespace Waffles.CrateRipper
             var filename = Path.GetFileName(source);
             if (string.Equals(filename, "selection-manifest.json", StringComparison.OrdinalIgnoreCase))
                 throw new IOException("A dependency uses the reserved staging manifest filename.");
-            Entry previous;
-            if (names.TryGetValue(filename, out previous))
-                throw new IOException("Different selected dependencies share the same filename: " + previous.sourcePath + " and " + source + ". They cannot be flattened safely.");
-            names.Add(filename, new Entry { sourcePath = source, filename = filename, bytes = new FileInfo(source).Length });
+            entriesByPath.Add(source, new Entry { sourcePath = source, filename = filename, bytes = new FileInfo(source).Length });
+        }
+
+        private static void AssignStagedPaths(IEnumerable<Entry> sourceEntries)
+        {
+            var entries = sourceEntries.ToList();
+            var originalNames = new HashSet<string>(entries.Select(entry => entry.filename), StringComparer.OrdinalIgnoreCase);
+            var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var collision in entries.GroupBy(entry => entry.filename, StringComparer.OrdinalIgnoreCase).Where(group => group.Count() > 1))
+                foreach (var entry in collision) directories.Add(Path.GetDirectoryName(entry.sourcePath));
+            var prefixes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var usedPrefixes = new HashSet<string>(originalNames, StringComparer.OrdinalIgnoreCase);
+            foreach (var directory in directories.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+            {
+                string hash;
+                using (var sha = SHA256.Create())
+                    hash = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(directory.ToUpperInvariant()))).Replace("-", "").ToLowerInvariant();
+                var prefix = "_bundle-" + hash.Substring(0, 16);
+                var unique = prefix;
+                int suffix = 2;
+                while (!usedPrefixes.Add(unique)) unique = prefix + "-" + suffix++;
+                prefixes.Add(directory, unique);
+            }
+            foreach (var entry in entries)
+            {
+                string prefix;
+                // Keep a colliding source directory's bundles and resources together.
+                // AssetRipper discovers these subfolders recursively and resolves
+                // cross-bundle references by serialized CAB identities, so original
+                // basenames and same-directory resource paths remain intact.
+                if (prefixes.TryGetValue(Path.GetDirectoryName(entry.sourcePath), out prefix))
+                    entry.filename = prefix + "/" + entry.filename;
+            }
         }
 
         private static void AssertSafeParents(string path)

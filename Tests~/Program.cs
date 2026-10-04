@@ -11,6 +11,7 @@ namespace Waffles.CrateRipper.Tests
             SourceCatalogTests.Register(cases);
             BackendTests.Register(cases);
             RecoveryTests.Register(cases);
+            ShaderRecoveryTests.Register(cases);
             int failed = 0;
             foreach (var test in cases)
             {

@@ -168,6 +168,12 @@ namespace Waffles.CrateRipper
                         Run(token => Rip(null, true, token));
                 EditorGUILayout.EndHorizontal();
                 DrawPending();
+                using (new EditorGUI.DisabledScope(!AssetDatabase.IsValidFolder(outputRoot)))
+                    if (GUILayout.Button("Repair shaders in output folder"))
+                    {
+                        try { SetStatus("Reconnected " + MaterialShaderRecovery.RepairFolder(outputRoot) + " material shaders. See shader-repair-report.txt."); }
+                        catch (Exception exception) { error = exception.Message; Debug.LogException(exception); }
+                    }
             }
             if (busy)
             {
@@ -239,6 +245,9 @@ namespace Waffles.CrateRipper
             ClearPending();
             var job = NewJob();
             var destination = Destination(wholeMod ? ModName() : crate.Name);
+            File.WriteAllText(Path.Combine(job, "request.json"), Newtonsoft.Json.JsonConvert.SerializeObject(new {
+                wholeMod, sourceFolder, destination, crate
+            }, Newtonsoft.Json.Formatting.Indented));
             var progress = Progress();
             string assets;
             string prefab = null;

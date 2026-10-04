@@ -11,7 +11,7 @@ Unity **2021.3 or newer**, Windows x64. The Marrow SDK is recommended for reconn
 3. Paste:
 
    ```text
-   https://github.com/Clyppe/waffles-crate-ripper.git#v1.0.2
+   https://github.com/Clyppe/waffles-crate-ripper.git#v1.0.3
    ```
 
 4. Open **Tools â†’ Waffles â†’ Crate Ripper**.
@@ -41,6 +41,10 @@ Large file work runs in the background. **Cancel operation** stops extraction. J
 
 Every recovered prefab is scanned. Identifiable MonoScript references are matched by **full type name** to components already installed in Unity, including Marrow and extended SDK components. Both the script GUID and local file ID are restored, preserving the component's serialized settings. Matching uses actual Unity MonoScript assets, including scripts imported from DLLs.
 
+When the original MonoSH or Bakery MonoSH MAS shader is unavailable, the importer can reconnect its shared material properties to the installed **SLZ/LitMAS/LitMAS Standard** shader. Textures, UV transforms, colors and scalar values are retained. This is a compatible replacement; the original baked MonoSH/Bakery lighting is not reconstructed, and the report identifies the substitution. Functional exact-name shader matches take precedence.
+
+For an existing import, click **Repair shaders in output folder**, or use **Tools → Waffles → Repair Recovered Shaders** for the default `Assets/Ripped Crates` folder. The action supports Unity Undo and writes `shader-repair-report.txt`.
+
 The importer gives copied assets fresh GUIDs and updates their references together. Native SDK script references continue pointing at the installed SDK. Shaders with an exact installed shader name can also be reconnected; their exported source is retained for inspection.
 
 Generated script files, assemblies and compilation configuration are preserved as text in `_RecoveredSource`, so importing a mod does not compile duplicate game assemblies. Unsupported binary serialized Unity assets are preserved in `_QuarantinedAssets` and described in the report.
@@ -65,6 +69,7 @@ Use the tool with assets you own or are allowed to recover. Extracted assets sta
 
 - Official [AssetRipper](https://github.com/AssetRipper/AssetRipper) 2.0.0 is launched as an owned, temporary loopback server. Imports and exports use its local backend routes.
 - Selected-crate operations stage only the root asset's recursive bundle dependency set; whole-mod operations require the separate **Rip entire mod / ZIP** action.
+- Bundle files sharing a basename are placed in separate staging subfolders with their own streaming companions, preserving their serialized identities and cross-bundle references.
 - AssetRipper exports into a fresh empty staging folder, and never receives the project's `Assets` folder as an export target.
 - ZIP extraction rejects traversal, duplicate paths, links, oversized archives and file/folder aliases.
 - Cancellation closes the backend process started by this operation.

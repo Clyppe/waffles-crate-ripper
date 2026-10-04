@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.3 — 2026-10-03
+
+- Fix selected-crate extraction failing when required bundles share a filename, including Backlot's two `polymer.bundle` files. Preserve both bundles and their own sidecars in separate staging folders.
+- Add compatible installed LitMAS Standard replacements for missing MonoSH and Bakery MonoSH MAS shaders, preserving shared material properties and reporting the lighting limitation.
+- Add an Undo-enabled shader repair action for existing imports.
+- Record crate requests in each job folder to make extraction errors diagnosable.
+- Validate duplicate-bundle extraction and material repairs in a real Unity SDK project.
+
 ## 1.0.2 — 2026-10-03
 
 - Resolve and stage only the selected crate's recursive bundle dependencies before running AssetRipper, instead of loading the entire BONELAB or pallet folder.

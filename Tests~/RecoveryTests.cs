@@ -34,7 +34,8 @@ namespace Waffles.CrateRipper.Tests
             tests.Add(new KeyValuePair<string, Action>("Selected crate retains only its linked streaming resources", SelectedSidecarIsolation));
             tests.Add(new KeyValuePair<string, Action>("Missing streaming resources are reported without unrelated payloads", MissingStreamingResource));
             tests.Add(new KeyValuePair<string, Action>("Bundle staging copies only explicit dependencies and own sidecars", BundleIsolation));
-            tests.Add(new KeyValuePair<string, Action>("Bundle staging rejects filename collisions and overwrites", BundleDestinationSafety));
+            tests.Add(new KeyValuePair<string, Action>("Bundle staging preserves colliding filenames and colocates sidecars", BundleFilenameCollisions));
+            tests.Add(new KeyValuePair<string, Action>("Bundle staging rejects missing inputs and overwrites", BundleDestinationSafety));
             tests.Add(new KeyValuePair<string, Action>("Canceled bundle staging removes only its temporary output", BundleCancellation));
             tests.Add(new KeyValuePair<string, Action>("Pallet folder lookup preserves platform alternatives and zero-crate dependencies", PalletFolderCandidates));
         }
@@ -346,15 +347,46 @@ namespace Waffles.CrateRipper.Tests
             using (var fixture = new Fixture("bundle-collisions"))
             {
                 var first = fixture.WriteBytes("first/same.bundle", new byte[] { 0, 4, 1 });
-                var second = fixture.WriteBytes("second/same.bundle", new byte[] { 0, 9, 7 });
                 var output = fixture.PathFor("collision-stage");
-                Check.Throws<IOException>(() => BundleStaging.Stage(new[] { first, second }, output, CancellationToken.None), "Colliding dependency basenames must fail without silent replacement.");
-                Check.True(!Directory.Exists(output), "Rejected collisions must not leave an output folder.");
                 Check.Throws<FileNotFoundException>(() => BundleStaging.Stage(new[] { fixture.PathFor("missing.bundle") }, output, CancellationToken.None), "Missing inputs must fail before staging.");
                 Check.Throws<ArgumentException>(() => BundleStaging.Stage(new string[0], output, CancellationToken.None), "Empty input sets must fail before staging.");
                 var sentinel = fixture.Write("existing-stage/keep.txt", "keep");
                 Check.Throws<IOException>(() => BundleStaging.Stage(new[] { first }, fixture.PathFor("existing-stage"), CancellationToken.None), "Existing nonempty staging output must not be overwritten.");
                 Check.Equal("keep", File.ReadAllText(sentinel), "Existing staging files must remain untouched.");
+            }
+        }
+
+        private static void BundleFilenameCollisions()
+        {
+            using (var fixture = new Fixture("bundle-filename-collisions"))
+            {
+                var physics = fixture.WriteBytes("physics/polymer.bundle", new byte[] { 0, 4, 1 });
+                var physicsSidecar = fixture.WriteBytes("physics/polymer.bundle.resS", new byte[] { 0, 8, 5 });
+                var physicsSibling = fixture.WriteBytes("physics/void.bundle", new byte[] { 0, 18, 11 });
+                var surface = fixture.WriteBytes("surface/polymer.bundle", new byte[] { 0, 9, 7 });
+                var surfaceSidecar = fixture.WriteBytes("surface/polymer.bundle.resS", new byte[] { 0, 27, 12 });
+                var unique = fixture.WriteBytes("other/selected.bundle", new byte[] { 0, 17, 3 });
+                fixture.WriteBytes("physics/unrelated.bundle", new byte[] { 0, 77, 19 });
+                fixture.WriteBytes("surface/unrelated.bundle.resS", new byte[] { 0, 91, 28 });
+                var selected = new[] { physics, surface, physicsSibling, unique, physics };
+                var output = fixture.PathFor("collision-stage");
+                BundleStaging.Stage(selected, output, CancellationToken.None);
+                var polymerFiles = Directory.GetFiles(output, "polymer.bundle", SearchOption.AllDirectories);
+                Check.Equal(2, polymerFiles.Length, "Different same-named bundles must both retain their original filenames.");
+                Check.Equal(2, polymerFiles.Select(Path.GetDirectoryName).Distinct(StringComparer.OrdinalIgnoreCase).Count(), "Colliding bundles must occupy separate staging subfolders.");
+                var copiedPhysics = polymerFiles.Single(path => File.ReadAllBytes(path).SequenceEqual(File.ReadAllBytes(physics)));
+                var copiedSurface = polymerFiles.Single(path => File.ReadAllBytes(path).SequenceEqual(File.ReadAllBytes(surface)));
+                Check.SameBytes(physicsSidecar, copiedPhysics + ".resS", "Physics resources must stay beside their owning bundle, without swapping bytes.");
+                Check.SameBytes(surfaceSidecar, copiedSurface + ".resS", "Surface resources must stay beside their owning bundle, without swapping bytes.");
+                Check.SameBytes(physicsSibling, Path.Combine(Path.GetDirectoryName(copiedPhysics), "void.bundle"), "Other explicit files from a relocated source directory must stay together.");
+                Check.SameBytes(unique, Path.Combine(output, "selected.bundle"), "Unrelated unique names must retain their existing flat staging paths.");
+                Check.True(!Directory.GetFiles(output, "unrelated*", SearchOption.AllDirectories).Any(), "Collision handling must not scan or import unselected source siblings.");
+                Check.Equal(7, Directory.GetFiles(output, "*", SearchOption.AllDirectories).Length, "Repeated selections must still deduplicate; expect six selected payloads plus the manifest.");
+                var secondOutput = fixture.PathFor("collision-stage-reversed");
+                BundleStaging.Stage(selected.Reverse(), secondOutput, CancellationToken.None);
+                var firstPaths = Directory.GetFiles(output, "*", SearchOption.AllDirectories).Select(path => path.Substring(output.Length + 1)).OrderBy(path => path).ToArray();
+                var secondPaths = Directory.GetFiles(secondOutput, "*", SearchOption.AllDirectories).Select(path => path.Substring(secondOutput.Length + 1)).OrderBy(path => path).ToArray();
+                Check.True(firstPaths.SequenceEqual(secondPaths), "Staged paths must remain stable when the dependency enumeration order changes.");
             }
         }
 

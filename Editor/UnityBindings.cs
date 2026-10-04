@@ -60,6 +60,7 @@ namespace Waffles.CrateRipper
                 }
             }
             foreach (var name in ambiguous) result.Remove(name);
+            MaterialShaderRecovery.AddCompatibleBindings(result);
             return result;
         }
 
