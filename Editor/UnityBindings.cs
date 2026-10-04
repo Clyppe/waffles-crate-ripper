@@ -87,29 +87,162 @@ namespace Waffles.CrateRipper
 
         internal static CrateEntry Crate(Object obj)
         {
-            if (obj == null || !obj.GetType().Name.EndsWith("Crate", StringComparison.Ordinal)) return null;
+            if (obj == null || !IsMarrowCrate(obj.GetType())) return null;
             var mainAsset = Member(obj, "MainAsset");
             var guid = Member(mainAsset, "AssetGUID") as string;
             var title = Member(obj, "Title") as string ?? obj.name;
             var path = string.IsNullOrEmpty(guid) ? "" : AssetDatabase.GUIDToAssetPath(guid);
             return new CrateEntry {
                 Name = title, Barcode = Member(obj, "Barcode")?.ToString() ?? "", MainAssetGuid = guid ?? "",
-                Kind = "project-" + obj.GetType().Name, PalletName = "Project",
+                Kind = obj.GetType().Name, PalletName = Member(Member(obj, "Pallet"), "Title") as string ?? "Project",
                 LocalPrefabPath = path, OriginalAssetPath = path
             };
         }
 
-        internal static List<CrateEntry> ProjectCrates()
+        private static bool IsMarrowCrate(Type type)
         {
-            return AssetDatabase.FindAssets("t:SpawnableCrate").Select(guid => Crate(AssetDatabase.LoadMainAssetAtPath(AssetDatabase.GUIDToAssetPath(guid))))
-                .Where(c => c != null).OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            for (; type != null; type = type.BaseType)
+                if (type.FullName == "SLZ.Marrow.Warehouse.Crate" || type.FullName == "SLZ.Warehouse.Crate") return true;
+            return false;
+        }
+
+        private static Type WarehouseType()
+        {
+            foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var type = assembly.GetType("SLZ.Marrow.Warehouse.AssetWarehouse", false)
+                    ?? assembly.GetType("SLZ.Warehouse.AssetWarehouse", false);
+                if (type != null) return type;
+            }
+            return null;
+        }
+
+        private static object WarehouseInstance(Type type)
+        {
+            if (type == null) return null;
+            return type.GetField("Instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null)
+                ?? type.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+        }
+
+        private static object Query(object target, string method)
+        {
+            if (target == null) return null;
+            var query = target.GetType().GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .FirstOrDefault(m => m.Name == method && !m.IsGenericMethod && m.GetParameters().Length == 0);
+            return query?.Invoke(target, null);
+        }
+
+        internal static string WarehouseState()
+        {
+            var type = WarehouseType();
+            var instance = WarehouseInstance(type);
+            if (instance == null) return type == null ? "SDK unavailable" : "Warehouse loading";
+            var ready = type.GetField("ready", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            try { return "Warehouse:" + ready + ":" + Query(instance, "CrateCount"); }
+            catch (Exception) { return "Warehouse loading"; }
+        }
+
+        internal static List<CrateEntry> AvailableCrates(Action<string> status = null)
+        {
+            var entries = new Dictionary<string, CrateEntry>(StringComparer.Ordinal);
+            var type = WarehouseType();
+            var warehouse = WarehouseInstance(type);
+            var manifests = new Dictionary<string, object>(StringComparer.Ordinal);
+            if (warehouse != null)
+            {
+                try
+                {
+                    if (Query(warehouse, "GetPalletManifests") is IEnumerable palletManifests)
+                        foreach (var manifest in palletManifests)
+                        {
+                            var barcode = Member(manifest, "PalletBarcode")?.ToString()
+                                ?? Member(Member(manifest, "Pallet"), "Barcode")?.ToString();
+                            if (!string.IsNullOrEmpty(barcode)) manifests[barcode] = manifest;
+                        }
+                    if (Query(warehouse, "GetCrates") is IEnumerable registeredCrates)
+                        foreach (var obj in registeredCrates)
+                        {
+                            var crate = Crate(obj as Object);
+                            if (crate == null) continue;
+                            var palletBarcode = Member(Member(obj, "Pallet"), "Barcode")?.ToString();
+                            if (palletBarcode != null && manifests.TryGetValue(palletBarcode, out var manifest))
+                            {
+                                crate.SourceFolder = ManifestFolder(manifest);
+                                var original = CatalogPrefab(Member(manifest, "Catalog"), crate.MainAssetGuid);
+                                if (!string.IsNullOrEmpty(original)) crate.OriginalAssetPath = original;
+                            }
+                            MergeCrate(entries, crate);
+                        }
+                }
+                catch (Exception ex) { status?.Invoke("Could not finish reading the Marrow warehouse: " + ex.GetBaseException().Message); }
+            }
+            // Authoring crates may exist before the asynchronous warehouse has loaded.
+            foreach (var guid in new[] { "t:Crate", "t:SpawnableCrate", "t:AvatarCrate", "t:LevelCrate" }
+                .SelectMany(filter => AssetDatabase.FindAssets(filter)).Distinct())
+            {
+                var crate = Crate(AssetDatabase.LoadMainAssetAtPath(AssetDatabase.GUIDToAssetPath(guid)));
+                if (crate != null) MergeCrate(entries, crate);
+            }
+            var recovered = entries.Values.Where(c => !string.IsNullOrEmpty(c.SourceFolder) && string.IsNullOrEmpty(c.OriginalAssetPath)).ToList();
+            ResolveCatalogPaths(recovered, message => status?.Invoke(message));
+            return entries.Values.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(c => c.PalletName, StringComparer.OrdinalIgnoreCase).ThenBy(c => c.Barcode, StringComparer.Ordinal).ToList();
+        }
+
+        private static void MergeCrate(Dictionary<string, CrateEntry> entries, CrateEntry entry)
+        {
+            var key = !string.IsNullOrEmpty(entry.Barcode) ? "barcode:" + entry.Barcode
+                : entry.Kind + "|" + entry.MainAssetGuid + "|" + entry.PalletName + "|" + entry.Name;
+            if (!entries.TryGetValue(key, out var previous)) { entries[key] = entry; return; }
+            var preferred = !string.IsNullOrEmpty(entry.LocalPrefabPath) && string.IsNullOrEmpty(previous.LocalPrefabPath) ? entry : previous;
+            var other = preferred == entry ? previous : entry;
+            if (string.IsNullOrEmpty(preferred.SourceFolder)) preferred.SourceFolder = other.SourceFolder;
+            if (string.IsNullOrEmpty(preferred.OriginalAssetPath)) preferred.OriginalAssetPath = other.OriginalAssetPath;
+            entries[key] = preferred;
+        }
+
+        private static string ManifestFolder(object manifest)
+        {
+            foreach (var name in new[] { "PalletPath", "CatalogPath" })
+            {
+                var path = Member(manifest, name) as string;
+                if (string.IsNullOrEmpty(path)) continue;
+                try
+                {
+                    if (Directory.Exists(path)) return Path.GetFullPath(path);
+                    var folder = Path.GetDirectoryName(Path.GetFullPath(path));
+                    if (Directory.Exists(folder)) return folder;
+                }
+                catch (ArgumentException) { }
+                catch (NotSupportedException) { }
+            }
+            return null;
+        }
+
+        private static string CatalogPrefab(object locator, string assetGuid)
+        {
+            if (locator == null || string.IsNullOrEmpty(assetGuid)) return null;
+            try
+            {
+                var locate = locator.GetType().GetMethods().FirstOrDefault(m => m.Name == "Locate" && m.GetParameters().Length == 3);
+                if (locate == null) return null;
+                var args = new object[] { assetGuid, null, null };
+                if (!(bool)locate.Invoke(locator, args) || !(args[2] is IEnumerable locations)) return null;
+                foreach (var location in locations)
+                {
+                    var id = Member(location, "InternalId") as string;
+                    if (!string.IsNullOrEmpty(id) && id.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase)) return id.Replace('\\', '/');
+                }
+            }
+            catch (Exception) { }
+            return null;
         }
 
         internal static void ResolveCatalogPaths(IEnumerable<CrateEntry> crates, Action<string> status)
         {
             var type = AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("UnityEngine.AddressableAssets.ResourceLocators.ContentCatalogData", false)).FirstOrDefault(t => t != null);
             if (type == null) { status("Addressables is not installed; exported prefab names will be used for matching."); return; }
-            foreach (var group in crates.GroupBy(c => c.SourceFolder))
+            foreach (var group in crates.Where(c => !string.IsNullOrEmpty(c.SourceFolder) && Directory.Exists(c.SourceFolder)).GroupBy(c => c.SourceFolder))
             foreach (var path in Directory.EnumerateFiles(group.Key, "catalog*.json", SearchOption.TopDirectoryOnly))
             {
                 try

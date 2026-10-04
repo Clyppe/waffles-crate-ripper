@@ -11,7 +11,7 @@ Unity **2021.3 or newer**, Windows x64. The Marrow SDK is recommended for reconn
 3. Paste:
 
    ```text
-   https://github.com/Clyppe/waffles-crate-ripper.git#v1.0.0
+   https://github.com/Clyppe/waffles-crate-ripper.git#v1.0.1
    ```
 
 4. Open **Tools â†’ Waffles â†’ Crate Ripper**.
@@ -21,13 +21,13 @@ The tool contains Editor code only. It adds no runtime components to your mod. U
 
 ## Rip one crate
 
-- Click **Project crates** to select a spawnable crate already authored in the project, or assign a crate asset and click **Use**.
+- The picker automatically lists crates from **Marrow's Asset Warehouse**, including built-in game crates, loaded mod pallets and project crates. Use **Find crate** to search the list, or **All available crates** to refresh it manually. The list also refreshes as the warehouse finishes loading pallets.
 - For a packed mod, choose **Load mod ZIP** or **Load mod folder**, then pick a crate from the searchable list. Loading your BONELAB `Mods` folder indexes its pallets too.
 - Click **Rip selected crate**.
 
 The output is `Assets/Ripped Crates/<crate name>`. Existing output folders get a numbered suffix. The import includes the selected prefab's referenced meshes, textures, materials, animation, audio and other recoverable assets.
 
-For packed mods, the installed Addressables package maps the crate's original asset GUID to its prefab path. If the catalog cannot identify a unique root prefab, the tool shows the recovered prefab list so you can select the correct one before importing. Clear **Spawnables only** to see avatar and level entries; individual extraction requires a prefab, while full-mod extraction includes scenes.
+For warehouse crates, the tool uses the pallet's registered bundle folder and catalog automatically. Project crates use their authored prefab directly. For ZIP/folder sources, the installed Addressables package maps the crate's original asset GUID to its prefab path. If the catalog cannot identify a unique root prefab, the tool shows the recovered prefab list so you can select the correct one before importing. Clear **Spawnables only** to see other crate types; individual extraction requires a prefab, while full-mod extraction includes scenes.
 
 ## Rip a whole ZIP or mod
 

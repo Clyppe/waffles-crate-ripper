@@ -1,6 +1,6 @@
 {
   "name": "com.clyppe.crate-ripper",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "displayName": "Waffles Crate Ripper",
   "description": "Recover BONELAB crate and mod assets, reconnect installed SDK scripts, and inspect import reports inside Unity.",
   "unity": "2021.3",

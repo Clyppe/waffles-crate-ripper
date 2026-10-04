@@ -6,7 +6,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using UnityEditor;
 using UnityEngine;
-using Object = UnityEngine.Object;
 
 namespace Waffles.CrateRipper
 {
@@ -25,7 +24,9 @@ namespace Waffles.CrateRipper
         [SerializeField] private string pendingDestination = "";
         [SerializeField] private string lastOutput = "";
         [SerializeField] private bool pendingWholeMod;
-        private Object selectedCrate;
+        [SerializeField] private bool browsingWarehouse = true;
+        private string warehouseState;
+        private double nextWarehousePoll;
         private Vector2 scroll;
         private string status = "Choose a crate or load a mod ZIP.";
         private string error = "";
@@ -52,9 +53,42 @@ namespace Waffles.CrateRipper
             if (string.IsNullOrEmpty(backend)) backend = EditorPrefs.GetString("Waffles.CrateRipper.Backend", "");
             if (!string.IsNullOrEmpty(exportedAssets) && Directory.Exists(exportedAssets)) RefreshPrefabChoices();
             AssemblyReloadEvents.beforeAssemblyReload += Cancel;
+            EditorApplication.update += PollWarehouse;
+            EditorApplication.delayCall += RefreshOnOpen;
         }
 
-        private void OnDisable() { AssemblyReloadEvents.beforeAssemblyReload -= Cancel; Cancel(); }
+        private void OnDisable()
+        {
+            AssemblyReloadEvents.beforeAssemblyReload -= Cancel;
+            EditorApplication.update -= PollWarehouse;
+            EditorApplication.delayCall -= RefreshOnOpen;
+            Cancel();
+        }
+
+        private void RefreshOnOpen() { if (this != null && browsingWarehouse && !busy && string.IsNullOrEmpty(exportedAssets)) RefreshCrates(); }
+
+        private void PollWarehouse()
+        {
+            if (!browsingWarehouse || busy || !string.IsNullOrEmpty(exportedAssets) || EditorApplication.timeSinceStartup < nextWarehousePoll) return;
+            nextWarehousePoll = EditorApplication.timeSinceStartup + 1;
+            var state = UnityBindings.WarehouseState();
+            if (state != warehouseState) RefreshCrates();
+        }
+
+        private void RefreshCrates()
+        {
+            var visible = VisibleCrates();
+            var oldBarcode = visible.Count > selected && selected >= 0 ? visible[selected].Barcode : null;
+            crates = UnityBindings.AvailableCrates(SetStatus);
+            sourceFolder = "";
+            sourceLabel = "";
+            browsingWarehouse = true;
+            warehouseState = UnityBindings.WarehouseState();
+            var current = VisibleCrates();
+            selected = string.IsNullOrEmpty(oldBarcode) ? 0 : Math.Max(current.FindIndex(c => c.Barcode == oldBarcode), 0);
+            ClearPending();
+            SetStatus("Found " + crates.Count + " available crates from the Marrow warehouse and project.");
+        }
         private void Cancel() { cancellation?.Cancel(); }
         private void SetStatus(string value) { status = value; Repaint(); }
         private IProgress<string> Progress() { return new Progress<string>(SetStatus); }
@@ -89,18 +123,9 @@ namespace Waffles.CrateRipper
                     var folder = EditorUtility.OpenFolderPanel("Select mod or Mods folder", DefaultMods(), "");
                     if (folder.Length > 0) Run(token => LoadFolder(folder, token));
                 }
-                if (GUILayout.Button("Project crates"))
-                { crates = UnityBindings.ProjectCrates(); sourceFolder = ""; selected = 0; ClearPending(); SetStatus("Found " + crates.Count + " project spawnable crates."); }
+                if (GUILayout.Button("All available crates")) RefreshCrates();
                 EditorGUILayout.EndHorizontal();
-                EditorGUILayout.BeginHorizontal();
-                selectedCrate = EditorGUILayout.ObjectField("Crate asset", selectedCrate, typeof(Object), false);
-                if (GUILayout.Button("Use", GUILayout.Width(50)))
-                {
-                    var crate = UnityBindings.Crate(selectedCrate ?? Selection.activeObject);
-                    if (crate == null) error = "Select a Marrow crate asset.";
-                    else { crates = new List<CrateEntry> { crate }; sourceFolder = ""; selected = 0; ClearPending(); }
-                }
-                EditorGUILayout.EndHorizontal();
+                if (browsingWarehouse) EditorGUILayout.LabelField("Marrow Asset Warehouse · built-in, loaded mod and project crates", EditorStyles.wordWrappedMiniLabel);
                 if (!string.IsNullOrEmpty(sourceFolder)) EditorGUILayout.LabelField(sourceFolder, EditorStyles.wordWrappedMiniLabel);
                 EditorGUILayout.BeginHorizontal();
                 search = EditorGUILayout.TextField("Find crate", search);
@@ -109,11 +134,12 @@ namespace Waffles.CrateRipper
                 var visible = VisibleCrates();
                 selected = Mathf.Clamp(selected, 0, Math.Max(visible.Count - 1, 0));
                 if (visible.Count > 0) selected = EditorGUILayout.Popup("Crate", selected, visible.Select(c => c.ToString()).ToArray());
-                else EditorGUILayout.HelpBox("No matching crates. Load a ZIP/folder or switch off Spawnables only for avatars and levels.", MessageType.None);
+                else EditorGUILayout.HelpBox("No matching crates yet. The list refreshes as Marrow loads its pallets. You can also load a ZIP/folder or switch off Spawnables only for other crate types.", MessageType.None);
                 if (visible.Count > 0)
                 {
                     EditorGUILayout.LabelField(visible[selected].Barcode, EditorStyles.wordWrappedMiniLabel);
                     if (!string.IsNullOrEmpty(visible[selected].OriginalAssetPath)) EditorGUILayout.LabelField(visible[selected].OriginalAssetPath, EditorStyles.wordWrappedMiniLabel);
+                    if (!string.IsNullOrEmpty(visible[selected].SourceFolder)) EditorGUILayout.LabelField("Pallet source: " + visible[selected].SourceFolder, EditorStyles.wordWrappedMiniLabel);
                 }
                 EditorGUILayout.Space();
                 EditorGUILayout.LabelField("Extraction backend", EditorStyles.boldLabel);
@@ -183,6 +209,7 @@ namespace Waffles.CrateRipper
         private async Task LoadFolder(string folder, CancellationToken token, string label = null)
         {
             ClearPending();
+            browsingWarehouse = false;
             sourceFolder = Path.GetFullPath(folder);
             sourceLabel = label ?? Path.GetFileName(sourceFolder.TrimEnd(Path.DirectorySeparatorChar));
             SetStatus("Reading pallet metadata...");
