@@ -27,6 +27,9 @@ namespace Waffles.CrateRipper
         public List<string> warnings = new List<string>();
         public List<string> missingScripts = new List<string>();
         public List<string> prefabs = new List<string>();
+        public List<string> scenes = new List<string>();
+        public List<string> spawnPolicies = new List<string>();
+        public List<string> missingSpawnPolicies = new List<string>();
         public List<string> recoveredSourceFiles = new List<string>();
         public List<string> quarantinedFiles = new List<string>();
         public List<string> missingAssetReferences = new List<string>();

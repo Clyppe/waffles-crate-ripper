@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using File = Waffles.CrateRipper.LongPathFile;
+using Directory = Waffles.CrateRipper.LongPathDirectory;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -65,8 +67,8 @@ namespace Waffles.CrateRipper
                     Directory.CreateDirectory(Path.GetDirectoryName(stagedPath));
                     // Chunked copies make Cancel responsive even for large bundles.
                     var buffer = new byte[128 * 1024];
-                    using (var input = new FileStream(entry.sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read))
-                    using (var output = new FileStream(stagedPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    using (var input = new FileStream(LongPathIO.ForIO(entry.sourcePath), FileMode.Open, FileAccess.Read, FileShare.Read))
+                    using (var output = new FileStream(LongPathIO.ForIO(stagedPath), FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     {
                         int count;
                         while ((count = input.Read(buffer, 0, buffer.Length)) != 0)
@@ -112,7 +114,7 @@ namespace Waffles.CrateRipper
             var filename = Path.GetFileName(source);
             if (string.Equals(filename, "selection-manifest.json", StringComparison.OrdinalIgnoreCase))
                 throw new IOException("A dependency uses the reserved staging manifest filename.");
-            entriesByPath.Add(source, new Entry { sourcePath = source, filename = filename, bytes = new FileInfo(source).Length });
+            entriesByPath.Add(source, new Entry { sourcePath = source, filename = filename, bytes = new FileInfo(LongPathIO.ForIO(source)).Length });
         }
 
         private static void AssignStagedPaths(IEnumerable<Entry> sourceEntries)

@@ -13,6 +13,11 @@ namespace Waffles.CrateRipper.Tests
         public static void Register(List<KeyValuePair<string, Action>> tests)
         {
             tests.Add(new KeyValuePair<string, Action>("Pallet indexes distinct crate types and names", PalletCrateTypes));
+            tests.Add(new KeyValuePair<string, Action>("Packed level chunks and crate assets are explicit roots", PackedRoots));
+            tests.Add(new KeyValuePair<string, Action>("Map and avatar filters recognize SDK and packed type names", CrateFilters));
+            tests.Add(new KeyValuePair<string, Action>("Map matching selects scene instead of similarly named prop", MapMatching));
+            tests.Add(new KeyValuePair<string, Action>("Avatar matching retains prefab identity and rejects ambiguous matches", AvatarMatching));
+            tests.Add(new KeyValuePair<string, Action>("Exported GUID identity wins over changed asset names", GuidMatching));
             tests.Add(new KeyValuePair<string, Action>("Folder names are safe and deterministic", FolderNames));
             tests.Add(new KeyValuePair<string, Action>("ZIP extracts nested bytes", ZipHappyPath));
             tests.Add(new KeyValuePair<string, Action>("ZIP rejects traversal before writing", ZipTraversal));
@@ -48,6 +53,79 @@ namespace Waffles.CrateRipper.Tests
                 Check.Equal(fixture.PathFor("A"), spawn.SourceFolder, "Source folder must identify the pallet's own directory.");
                 fixture.Write("Bad.pallet.json", "{}");
                 Check.Throws<InvalidDataException>(() => SourceCatalog.ReadPallets(fixture.Root), "Malformed pallet schema should be reported");
+            }
+        }
+
+        private static void PackedRoots()
+        {
+            using (var fixture = new Fixture("packed-level"))
+            {
+                fixture.Write("Level/Test.pallet.json", @"{
+                    'root': {'ref':'pallet'}, 'objects': {
+                    'pallet': {'title':'Test','crates':[{'ref':'level','type':'crate-level#0'}, {'ref':'avatar','type':'crate-avatar#0'}]},
+                    'level': {'title':'Map','mainAsset':'11111111111111111111111111111111','packedAssets':[
+                        {'title':'PersistentScenes','subAssets':['22222222222222222222222222222222']},
+                        {'title':'ChunkScenes','subAssets':['33333333333333333333333333333333','22222222222222222222222222222222']},
+                        {'title':'Ignore duplicate main','guid':'11111111111111111111111111111111'}]},
+                    'avatar': {'title':'Avatar','mainAsset':'44444444444444444444444444444444','packedAssets':[
+                        {'title':'PreviewMesh','guid':'55555555555555555555555555555555'}]}
+                    }}");
+                var crates = SourceCatalog.ReadPallets(fixture.Root);
+                var level = crates.Single(c => c.Name == "Map");
+                Check.Equal(2, level.AdditionalAssets.Count, "Persistent/chunk roots must be deduplicated and must not duplicate the main scene.");
+                Check.True(level.AdditionalAssets.Any(a => a.Guid == "33333333333333333333333333333333"), "Chunk scene GUIDs must survive without a direct YAML reference from the main scene.");
+                Check.Equal("55555555555555555555555555555555", crates.Single(c => c.Name == "Avatar").AdditionalAssets.Single().Guid, "Avatar packed preview assets must be identified independently of its prefab.");
+            }
+        }
+
+        private static void CrateFilters()
+        {
+            foreach (var type in new[] { "LevelCrate", "crate-level#0" })
+            {
+                var crate = new CrateEntry { Kind = type };
+                Check.True(SourceCatalog.MatchesKind(crate, CrateKindFilter.Maps) && SourceCatalog.MatchesKind(crate, CrateKindFilter.All), "Both SDK and packed level names must be visible.");
+                Check.True(!SourceCatalog.MatchesKind(crate, CrateKindFilter.Spawnables), "A map must not be offered as a spawnable prefab.");
+            }
+            foreach (var type in new[] { "AvatarCrate", "crate-avatar#0" })
+                Check.True(SourceCatalog.MatchesKind(new CrateEntry { Kind = type }, CrateKindFilter.Avatars), "Both SDK and packed avatar names must be visible.");
+        }
+
+        private static void MapMatching()
+        {
+            using (var fixture = new Fixture("map-root-match"))
+            {
+                fixture.Asset("Scenes/Test Map.unity", "11111111111111111111111111111111", "%YAML 1.1\n--- !u!1 &1\nGameObject: {}\n");
+                fixture.Asset("Props/Test Map.prefab", "22222222222222222222222222222222", "%YAML 1.1\n--- !u!1 &1\nGameObject: {}\n");
+                var crate = new CrateEntry { Name = "Test Map", Kind = "crate-level#0", OriginalAssetPath = "Assets/Source/Test Map.unity" };
+                Check.Equal("Scenes/Test Map.unity", SourceCatalog.MatchMainAsset(fixture.Root, crate), "A level root must be a scene even when a prop shares its name.");
+                crate.Name = "Missing"; crate.OriginalAssetPath = "Assets/Missing.unity";
+                Check.Equal<string>(null, SourceCatalog.MatchMainAsset(fixture.Root, crate), "Unresolved levels must require explicit scene selection, never a random recovered prefab.");
+            }
+        }
+
+        private static void AvatarMatching()
+        {
+            using (var fixture = new Fixture("avatar-root-match"))
+            {
+                fixture.Asset("Avatars/Actor.prefab", "11111111111111111111111111111111", "%YAML 1.1\n--- !u!1 &1\nGameObject: {}\n");
+                fixture.Asset("Scenes/Actor.unity", "22222222222222222222222222222222", "%YAML 1.1\n--- !u!1 &1\nGameObject: {}\n");
+                var crate = new CrateEntry { Name = "Actor", Kind = "AvatarCrate", OriginalAssetPath = "Assets/Original/Actor.prefab" };
+                Check.Equal("Avatars/Actor.prefab", SourceCatalog.MatchMainAsset(fixture.Root, crate), "Avatar roots must remain prefabs, preserving their hierarchy and rig dependencies for recovery.");
+                fixture.Asset("Other/Actor.prefab", "33333333333333333333333333333333", "%YAML 1.1\n--- !u!1 &1\nGameObject: {}\n");
+                Check.Equal<string>(null, SourceCatalog.MatchMainAsset(fixture.Root, crate), "Duplicate names must require explicit selection.");
+                crate.OriginalAssetPath = "Assets/Avatars/Actor.prefab";
+                Check.Equal("Avatars/Actor.prefab", SourceCatalog.MatchMainAsset(fixture.Root, crate), "An exact catalog path must disambiguate equally named avatars.");
+            }
+        }
+
+        private static void GuidMatching()
+        {
+            using (var fixture = new Fixture("asset-guid-match"))
+            {
+                fixture.Asset("Changed/Recovered.unity", "11111111111111111111111111111111", "%YAML 1.1\n--- !u!1 &1\nGameObject: {}\n");
+                fixture.Asset("Scenes/Original.unity", "22222222222222222222222222222222", "%YAML 1.1\n--- !u!1 &1\nGameObject: {}\n");
+                var crate = new CrateEntry { Name = "Original", Kind = "LevelCrate", MainAssetGuid = "11111111111111111111111111111111", OriginalAssetPath = "Assets/Scenes/Original.unity" };
+                Check.Equal("Changed/Recovered.unity", SourceCatalog.MatchMainAsset(fixture.Root, crate), "A known GUID must be preferred to a similarly named scene.");
             }
         }
 

@@ -2,6 +2,8 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using File = Waffles.CrateRipper.LongPathFile;
+using Directory = Waffles.CrateRipper.LongPathDirectory;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -94,13 +96,41 @@ namespace Waffles.CrateRipper
             var guid = Member(mainAsset, "AssetGUID") as string;
             var title = Member(obj, "Title") as string ?? obj.name;
             var path = string.IsNullOrEmpty(guid) ? "" : AssetDatabase.GUIDToAssetPath(guid);
-            return new CrateEntry {
+            var entry = new CrateEntry {
                 Name = title, Barcode = Member(obj, "Barcode")?.ToString() ?? "", MainAssetGuid = guid ?? "",
                 Kind = obj.GetType().Name, PalletName = Member(Member(obj, "Pallet"), "Title") as string ?? "Project",
                 PalletBarcode = Member(Member(obj, "Pallet"), "Barcode")?.ToString() ?? "",
                 LocalPrefabPath = path, OriginalAssetPath = path
             };
+            AddPackedAssets(entry, obj);
+            return entry;
         }
+
+        private static void AddPackedAssets(CrateEntry entry, object crate)
+        {
+            if (Member(crate, "PackedAssets") is IEnumerable packedAssets)
+                foreach (var packed in packedAssets)
+                {
+                    AddAsset(entry, Member(Member(packed, "marrowAsset"), "AssetGUID") as string);
+                    if (Member(packed, "subAssets") is IEnumerable subAssets)
+                        foreach (var sub in subAssets) AddAsset(entry, Member(Member(sub, "subAsset"), "AssetGUID") as string);
+                }
+            // Authored level crates do not necessarily have their PackedAssets
+            // list populated until pack time. Include only runtime scene roots.
+            foreach (var name in new[] { "PersistentScenes", "ChunkScenes" })
+                if (Member(crate, name) is IEnumerable scenes)
+                    foreach (var scene in scenes) AddAsset(entry, Member(scene, "AssetGUID") as string);
+        }
+
+        private static void AddAsset(CrateEntry entry, string guid)
+        {
+            if (string.IsNullOrEmpty(guid) || string.Equals(guid, entry.MainAssetGuid, StringComparison.OrdinalIgnoreCase)
+                || entry.AdditionalAssets.Any(a => string.Equals(a.Guid, guid, StringComparison.OrdinalIgnoreCase))) return;
+            var path = AssetDatabase.GUIDToAssetPath(guid);
+            entry.AdditionalAssets.Add(new CrateAssetEntry { Guid = guid, LocalAssetPath = path, OriginalAssetPath = path });
+        }
+
+        private static string MainExtension(CrateEntry crate) { return SourceCatalog.IsMap(crate) ? ".unity" : ".prefab"; }
 
         private static bool IsMarrowCrate(Type type)
         {
@@ -172,8 +202,10 @@ namespace Waffles.CrateRipper
                             {
                                 crate.SourceFolder = ManifestFolder(manifest);
                                 crate.SourceRoot = crate.SourceFolder;
-                                var original = CatalogPrefab(Member(manifest, "Catalog"), crate.MainAssetGuid);
+                                var original = CatalogAsset(Member(manifest, "Catalog"), crate.MainAssetGuid, MainExtension(crate));
                                 if (!string.IsNullOrEmpty(original)) crate.OriginalAssetPath = original;
+                                foreach (var asset in crate.AdditionalAssets)
+                                    asset.OriginalAssetPath = CatalogAsset(Member(manifest, "Catalog"), asset.Guid) ?? asset.OriginalAssetPath;
                             }
                             MergeCrate(entries, crate);
                         }
@@ -204,6 +236,16 @@ namespace Waffles.CrateRipper
             if (string.IsNullOrEmpty(preferred.SourceRoot)) preferred.SourceRoot = other.SourceRoot;
             if (string.IsNullOrEmpty(preferred.PalletBarcode)) preferred.PalletBarcode = other.PalletBarcode;
             if (string.IsNullOrEmpty(preferred.OriginalAssetPath)) preferred.OriginalAssetPath = other.OriginalAssetPath;
+            foreach (var extra in other.AdditionalAssets ?? new List<CrateAssetEntry>())
+            {
+                var found = preferred.AdditionalAssets.FirstOrDefault(a => string.Equals(a.Guid, extra.Guid, StringComparison.OrdinalIgnoreCase));
+                if (found == null) preferred.AdditionalAssets.Add(extra);
+                else
+                {
+                    if (string.IsNullOrEmpty(found.LocalAssetPath)) found.LocalAssetPath = extra.LocalAssetPath;
+                    if (string.IsNullOrEmpty(found.OriginalAssetPath)) found.OriginalAssetPath = extra.OriginalAssetPath;
+                }
+            }
             entries[key] = preferred;
         }
 
@@ -225,7 +267,7 @@ namespace Waffles.CrateRipper
             return null;
         }
 
-        private static string CatalogPrefab(object locator, string assetGuid)
+        private static string CatalogAsset(object locator, string assetGuid, string extension = null)
         {
             if (locator == null || string.IsNullOrEmpty(assetGuid)) return null;
             try
@@ -237,7 +279,7 @@ namespace Waffles.CrateRipper
                 foreach (var location in locations)
                 {
                     var id = Member(location, "InternalId") as string;
-                    if (!string.IsNullOrEmpty(id) && id.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase)) return id.Replace('\\', '/');
+                    if (!string.IsNullOrEmpty(id) && (string.IsNullOrEmpty(extension) || id.EndsWith(extension, StringComparison.OrdinalIgnoreCase))) return id.Replace('\\', '/');
                 }
             }
             catch (Exception) { }
@@ -312,8 +354,21 @@ namespace Waffles.CrateRipper
                 throw new InvalidOperationException("Cannot resolve the selected crate's bundle dependencies from its catalog. " +
                     "Load its complete mod ZIP or pallet folder and ensure Addressables is installed. " + string.Join("; ", catalogErrors));
             var prefab = roots.Select(location => Member(location, "InternalId") as string)
-                .FirstOrDefault(id => !string.IsNullOrEmpty(id) && id.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase));
+                .FirstOrDefault(id => !string.IsNullOrEmpty(id) && id.EndsWith(MainExtension(crate), StringComparison.OrdinalIgnoreCase));
             if (!string.IsNullOrEmpty(prefab)) crate.OriginalAssetPath = prefab.Replace('\\', '/');
+            foreach (var asset in crate.AdditionalAssets ?? new List<CrateAssetEntry>())
+            {
+                List<object> extraRoots = null;
+                foreach (var locator in locators)
+                {
+                    extraRoots = Locate(locator, asset.Guid);
+                    if (extraRoots.Count > 0) break;
+                }
+                if (extraRoots == null || extraRoots.Count == 0)
+                    throw new InvalidOperationException("Cannot resolve packed asset " + asset.Guid + " belonging to the selected crate. Supply its complete pallet/catalog.");
+                asset.OriginalAssetPath = extraRoots.Select(location => Member(location, "InternalId") as string).FirstOrDefault(id => !string.IsNullOrEmpty(id));
+                roots.AddRange(extraRoots);
+            }
 
             var pending = new Queue<object>(roots);
             var visited = new HashSet<object>(new LocationIdentity());
@@ -436,7 +491,7 @@ namespace Waffles.CrateRipper
         internal static void ResolveCatalogPaths(IEnumerable<CrateEntry> crates, Action<string> status)
         {
             var type = AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("UnityEngine.AddressableAssets.ResourceLocators.ContentCatalogData", false)).FirstOrDefault(t => t != null);
-            if (type == null) { status("Addressables is not installed; exported prefab names will be used for matching."); return; }
+            if (type == null) { status("Addressables is not installed; exported scene/prefab names will be used for matching."); return; }
             foreach (var group in crates.Where(c => !string.IsNullOrEmpty(c.SourceFolder) && Directory.Exists(c.SourceFolder)).GroupBy(c => c.SourceFolder))
             foreach (var path in Directory.EnumerateFiles(group.Key, "catalog*.json", SearchOption.TopDirectoryOnly))
             {
@@ -446,17 +501,11 @@ namespace Waffles.CrateRipper
                     var create = type.GetMethod("CreateLocator", new[] { typeof(string) });
                     var locator = create?.Invoke(data, new object[] { null });
                     if (locator == null) continue;
-                    var locate = locator.GetType().GetMethods().First(m => m.Name == "Locate" && m.GetParameters().Length == 3);
                     foreach (var crate in group)
                     {
-                        var args = new object[] { crate.MainAssetGuid, null, null };
-                        if (!(bool)locate.Invoke(locator, args)) continue;
-                        foreach (var location in (IEnumerable)args[2])
-                        {
-                            var internalId = Member(location, "InternalId") as string;
-                            if (!string.IsNullOrEmpty(internalId) && internalId.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
-                            { crate.OriginalAssetPath = internalId.Replace('\\', '/'); break; }
-                        }
+                        crate.OriginalAssetPath = CatalogAsset(locator, crate.MainAssetGuid, MainExtension(crate)) ?? crate.OriginalAssetPath;
+                        foreach (var asset in crate.AdditionalAssets ?? new List<CrateAssetEntry>())
+                            asset.OriginalAssetPath = CatalogAsset(locator, asset.Guid) ?? asset.OriginalAssetPath;
                     }
                 }
                 catch (Exception ex) { status("Catalog mapping unavailable for " + Path.GetFileName(path) + ": " + ex.GetBaseException().Message); }
@@ -466,10 +515,12 @@ namespace Waffles.CrateRipper
         internal static string StageProjectCrate(CrateEntry crate, string jobFolder)
         {
             if (string.IsNullOrEmpty(crate.LocalPrefabPath))
-                throw new InvalidOperationException("This crate's prefab is not in the project. Load its packed mod folder or ZIP instead.");
+                throw new InvalidOperationException("This crate's main scene/prefab is not in the project. Load its packed mod folder or ZIP instead.");
             var stage = Path.Combine(jobFolder, "ProjectSource");
             Directory.CreateDirectory(stage);
-            foreach (var path in AssetDatabase.GetDependencies(crate.LocalPrefabPath, true))
+            var roots = new[] { crate.LocalPrefabPath }.Concat((crate.AdditionalAssets ?? new List<CrateAssetEntry>())
+                .Select(a => a.LocalAssetPath).Where(p => !string.IsNullOrEmpty(p))).Distinct().ToArray();
+            foreach (var path in AssetDatabase.GetDependencies(roots, true))
             {
                 if (!(path.StartsWith("Assets/", StringComparison.Ordinal) || path.StartsWith("Packages/", StringComparison.Ordinal))) continue;
                 var source = PhysicalAssetPath(path);
@@ -482,21 +533,31 @@ namespace Waffles.CrateRipper
             return stage;
         }
 
+        // Kept for existing callers; this now resolves the crate's main asset,
+        // including LevelCrate scenes, rather than assuming every root is a prefab.
         internal static string MatchPrefab(string exportedAssets, CrateEntry crate)
+        { return SourceCatalog.MatchMainAsset(exportedAssets, crate); }
+
+        internal static List<string> MatchAdditionalAssets(string exportedAssets, CrateEntry crate, out List<string> warnings)
         {
-            var prefabs = Directory.GetFiles(exportedAssets, "*.prefab", SearchOption.AllDirectories);
-            if (!string.IsNullOrEmpty(crate.OriginalAssetPath))
+            warnings = new List<string>();
+            var result = new List<string>();
+            foreach (var asset in crate.AdditionalAssets ?? new List<CrateAssetEntry>())
             {
-                var original = crate.OriginalAssetPath.Replace('\\', '/');
-                if (original.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)) original = original.Substring(7);
-                var exact = prefabs.Where(p => Relative(exportedAssets, p).Equals(original, StringComparison.OrdinalIgnoreCase)).ToArray();
-                if (exact.Length == 1) return Relative(exportedAssets, exact[0]);
-                var fileName = Path.GetFileNameWithoutExtension(original);
-                var named = prefabs.Where(p => Path.GetFileNameWithoutExtension(p).Equals(fileName, StringComparison.OrdinalIgnoreCase)).ToArray();
-                if (named.Length == 1) return Relative(exportedAssets, named[0]);
+                var path = SourceCatalog.MatchExportedAsset(exportedAssets, asset.Guid, asset.OriginalAssetPath,
+                    fallbackName: string.IsNullOrEmpty(asset.OriginalAssetPath) ? null : Path.GetFileNameWithoutExtension(asset.OriginalAssetPath));
+                if (!string.IsNullOrEmpty(path)) result.Add(path);
+                else
+                {
+                    var message = "Packed crate asset could not be identified in the export: " + asset.Guid + " " + asset.OriginalAssetPath;
+                    // A missing chunk would produce an incomplete map. Do not
+                    // silently replace it with a similarly named prop or other level.
+                    if ((asset.OriginalAssetPath ?? "").EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException(message);
+                    warnings.Add(message);
+                }
             }
-            var matches = prefabs.Where(p => Path.GetFileNameWithoutExtension(p).Equals(crate.Name, StringComparison.OrdinalIgnoreCase)).ToArray();
-            return matches.Length == 1 ? Relative(exportedAssets, matches[0]) : null;
+            return result.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
 
         internal static string Relative(string root, string path)

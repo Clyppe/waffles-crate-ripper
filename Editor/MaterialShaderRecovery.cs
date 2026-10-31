@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using File = Waffles.CrateRipper.LongPathFile;
+using Directory = Waffles.CrateRipper.LongPathDirectory;
 using UnityEditor;
 using UnityEngine;
 

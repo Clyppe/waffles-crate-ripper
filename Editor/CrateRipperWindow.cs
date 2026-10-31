@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using File = Waffles.CrateRipper.LongPathFile;
+using Directory = Waffles.CrateRipper.LongPathDirectory;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEditor;
+using UnityEditor.SceneManagement;
 using UnityEngine;
 
 namespace Waffles.CrateRipper
@@ -17,13 +20,16 @@ namespace Waffles.CrateRipper
         [SerializeField] private string backend = "";
         [SerializeField] private string outputRoot = "Assets/Ripped Crates";
         [SerializeField] private string search = "";
-        [SerializeField] private bool spawnablesOnly = true;
+        [SerializeField] private CrateKindFilter crateKind = CrateKindFilter.All;
         [SerializeField] private bool reuseShaders = true;
         [SerializeField] private int selected;
         [SerializeField] private string exportedAssets = "";
         [SerializeField] private string pendingDestination = "";
         [SerializeField] private string lastOutput = "";
         [SerializeField] private bool pendingWholeMod;
+        [SerializeField] private bool pendingIsMap;
+        [SerializeField] private List<string> pendingAdditionalRoots = new List<string>();
+        [SerializeField] private List<string> pendingWarnings = new List<string>();
         [SerializeField] private bool browsingWarehouse = true;
         private string warehouseState;
         private double nextWarehousePoll;
@@ -108,7 +114,7 @@ namespace Waffles.CrateRipper
         {
             scroll = EditorGUILayout.BeginScrollView(scroll);
             EditorGUILayout.LabelField("Waffles Crate Ripper", EditorStyles.boldLabel);
-            EditorGUILayout.HelpBox("Pick a spawnable crate, or extract an entire mod. Textures, models, materials, animation, audio and referenced assets are gathered into a named folder.", MessageType.Info);
+            EditorGUILayout.HelpBox("Pick a spawnable, avatar or map crate, or extract an entire mod. Maps keep editable scenes; avatars keep their rig, meshes and referenced assets in a named folder.", MessageType.Info);
             using (new EditorGUI.DisabledScope(busy))
             {
                 EditorGUILayout.LabelField("Source", EditorStyles.boldLabel);
@@ -129,12 +135,12 @@ namespace Waffles.CrateRipper
                 if (!string.IsNullOrEmpty(sourceFolder)) EditorGUILayout.LabelField(sourceFolder, EditorStyles.wordWrappedMiniLabel);
                 EditorGUILayout.BeginHorizontal();
                 search = EditorGUILayout.TextField("Find crate", search);
-                spawnablesOnly = GUILayout.Toggle(spawnablesOnly, "Spawnables only", GUILayout.Width(135));
+                crateKind = (CrateKindFilter)EditorGUILayout.EnumPopup(crateKind, GUILayout.Width(125));
                 EditorGUILayout.EndHorizontal();
                 var visible = VisibleCrates();
                 selected = Mathf.Clamp(selected, 0, Math.Max(visible.Count - 1, 0));
                 if (visible.Count > 0) selected = EditorGUILayout.Popup("Crate", selected, visible.Select(c => c.ToString()).ToArray());
-                else EditorGUILayout.HelpBox("No matching crates yet. The list refreshes as Marrow loads its pallets. You can also load a ZIP/folder or switch off Spawnables only for other crate types.", MessageType.None);
+                else EditorGUILayout.HelpBox("No matching crates yet. The list refreshes as Marrow loads its pallets. You can also load a ZIP/folder or choose All to show maps and avatars too.", MessageType.None);
                 if (visible.Count > 0)
                 {
                     EditorGUILayout.LabelField(visible[selected].Barcode, EditorStyles.wordWrappedMiniLabel);
@@ -174,6 +180,16 @@ namespace Waffles.CrateRipper
                         try { SetStatus("Reconnected " + MaterialShaderRecovery.RepairFolder(outputRoot) + " material shaders. See shader-repair-report.txt."); }
                         catch (Exception exception) { error = exception.Message; Debug.LogException(exception); }
                     }
+                using (new EditorGUI.DisabledScope(!AssetDatabase.IsValidFolder(outputRoot)))
+                    if (GUILayout.Button("Repair static meshes in output folder"))
+                    {
+                        try
+                        {
+                            var repaired = StaticMeshRecovery.RepairFolder(outputRoot);
+                            SetStatus("Made " + repaired.repairedRenderers + " static renderers editable. See static-mesh-repair-report.json.");
+                        }
+                        catch (Exception exception) { error = exception.Message; Debug.LogException(exception); }
+                    }
             }
             if (busy)
             {
@@ -196,7 +212,7 @@ namespace Waffles.CrateRipper
 
         private List<CrateEntry> VisibleCrates()
         {
-            return crates.Where(c => (!spawnablesOnly || c.Kind.IndexOf("spawnable", StringComparison.OrdinalIgnoreCase) >= 0) &&
+            return crates.Where(c => SourceCatalog.MatchesKind(c, crateKind) &&
                 (string.IsNullOrWhiteSpace(search) || (c.Name + " " + c.Barcode + " " + c.PalletName).IndexOf(search, StringComparison.OrdinalIgnoreCase) >= 0)).ToList();
         }
 
@@ -251,11 +267,14 @@ namespace Waffles.CrateRipper
             var progress = Progress();
             string assets;
             string prefab = null;
+            var additionalRoots = new List<string>();
+            var importWarnings = new List<string>();
             if (!wholeMod && !string.IsNullOrEmpty(crate.LocalPrefabPath))
             {
                 SetStatus("Gathering project crate dependencies...");
                 assets = UnityBindings.StageProjectCrate(crate, job);
                 prefab = crate.LocalPrefabPath;
+                additionalRoots = (crate.AdditionalAssets ?? new List<CrateAssetEntry>()).Select(a => a.LocalAssetPath).Where(p => !string.IsNullOrEmpty(p)).ToList();
             }
             else
             {
@@ -271,16 +290,21 @@ namespace Waffles.CrateRipper
                 if (string.IsNullOrEmpty(input)) throw new InvalidOperationException("Load the mod folder or ZIP containing this crate first.");
                 assets = await AssetRipperBackend.ExportAsync(backend, input, Path.Combine(job, "Export"), progress, token);
                 token.ThrowIfCancellationRequested();
-                if (!wholeMod) prefab = UnityBindings.MatchPrefab(assets, crate);
+                if (!wholeMod)
+                {
+                    prefab = UnityBindings.MatchPrefab(assets, crate);
+                    additionalRoots = UnityBindings.MatchAdditionalAssets(assets, crate, out importWarnings);
+                }
             }
             if (!wholeMod && string.IsNullOrEmpty(prefab))
             {
                 exportedAssets = assets; pendingDestination = destination; pendingWholeMod = false;
+                pendingIsMap = SourceCatalog.IsMap(crate); pendingAdditionalRoots = additionalRoots; pendingWarnings = importWarnings;
                 RefreshPrefabChoices();
-                SetStatus("Export complete. The catalog did not identify one exact prefab. Choose it below to finish the crate import.");
+                SetStatus("Export complete. The catalog did not identify one exact scene/prefab. Choose its root below to finish the crate import.");
                 return;
             }
-            await Import(assets, destination, prefab, wholeMod, token);
+            await Import(assets, destination, prefab, wholeMod, token, additionalRoots, importWarnings);
         }
 
         private string ModName()
@@ -289,15 +313,22 @@ namespace Waffles.CrateRipper
             return names.Length == 1 ? names[0] : sourceLabel;
         }
 
-        private async Task Import(string assets, string destination, string prefab, bool wholeMod, CancellationToken token)
+        private async Task Import(string assets, string destination, string prefab, bool wholeMod, CancellationToken token,
+            List<string> additionalRoots = null, List<string> importWarnings = null)
         {
             var scripts = UnityBindings.Scripts();
             var shaders = reuseShaders ? UnityBindings.Shaders() : null;
             SetStatus("Recovering dependencies and reconnecting installed scripts...");
             // Bind Unity objects on the editor thread; pure file work can run in the background.
-            var report = await Task.Run(() => RecoveryPipeline.Import(assets, destination, prefab, wholeMod, scripts, shaders, token), token);
+            var report = await Task.Run(() => RecoveryPipeline.Import(assets, destination, prefab, wholeMod, scripts, shaders, token, additionalRoots), token);
             lastOutput = destination;
             AssetDatabase.Refresh();
+            if (importWarnings != null) report.warnings.AddRange(importWarnings);
+            SetStatus("Restoring editable static meshes in recovered scenes and prefabs...");
+            var meshRepair = StaticMeshRecovery.RepairFolder(destination, token);
+            report.warnings.AddRange(meshRepair.warnings);
+            File.WriteAllText(Path.Combine(ProjectRoot, destination, "recovery-report.json"),
+                Newtonsoft.Json.JsonConvert.SerializeObject(report, Newtonsoft.Json.Formatting.Indented) + "\n");
             await ValidatePrefabs(report, token);
             ClearPending();
             SetStatus("Imported into " + destination + ". Repaired " + report.repairedScriptReferences + " script references; " + report.missingScripts.Count + " unresolved script entries. See the repair report.");
@@ -323,23 +354,45 @@ namespace Waffles.CrateRipper
             File.WriteAllText(Path.Combine(ProjectRoot, report.outputFolder, "unity-prefab-check.txt"),
                 report.prefabs.Count == 0 ? "No prefabs were recovered in this import. See recovery-report.json for scene and asset diagnostics.\n" :
                 messages.Count == 0 ? "Every recovered prefab loaded in Unity with no missing-script components. Runtime behavior still requires testing.\n" : string.Join("\n", messages));
+            var sceneMessages = new List<string>();
+            foreach (var path in Directory.GetFiles(Path.Combine(ProjectRoot, report.outputFolder), "*.unity", SearchOption.AllDirectories))
+            {
+                token.ThrowIfCancellationRequested();
+                var assetPath = UnityBindings.Relative(ProjectRoot, path);
+                var scene = UnityEngine.SceneManagement.SceneManager.GetSceneByPath(assetPath);
+                bool opened = !scene.IsValid() || !scene.isLoaded;
+                try
+                {
+                    if (opened) scene = EditorSceneManager.OpenScene(assetPath, OpenSceneMode.Additive);
+                    int missing = scene.GetRootGameObjects().Sum(root => root.GetComponentsInChildren<Transform>(true)
+                        .Sum(t => GameObjectUtility.GetMonoBehavioursWithMissingScriptCount(t.gameObject)));
+                    if (missing > 0) sceneMessages.Add(assetPath + ": " + missing + " missing script components.");
+                }
+                catch (Exception ex) { sceneMessages.Add(assetPath + ": " + ex.GetBaseException().Message); }
+                finally { if (opened && scene.IsValid() && scene.isLoaded) EditorSceneManager.CloseScene(scene, true); }
+                await Task.Yield();
+            }
+            File.WriteAllText(Path.Combine(ProjectRoot, report.outputFolder, "unity-scene-check.txt"),
+                report.scenes.Count == 0 ? "No scenes were recovered in this import.\n" :
+                sceneMessages.Count == 0 ? "Every recovered scene opened in Unity with no missing-script components. Runtime behavior still requires testing.\n" : string.Join("\n", sceneMessages));
             AssetDatabase.Refresh();
         }
 
-        private void ClearPending() { exportedAssets = ""; pendingDestination = ""; exportedPrefabs = null; }
+        private void ClearPending() { exportedAssets = ""; pendingDestination = ""; exportedPrefabs = null; pendingAdditionalRoots.Clear(); pendingWarnings.Clear(); pendingIsMap = false; }
         private void RefreshPrefabChoices()
-        { exportedPrefabs = Directory.GetFiles(exportedAssets, "*.prefab", SearchOption.AllDirectories).Select(p => UnityBindings.Relative(exportedAssets, p)).OrderBy(p => p).ToArray(); selectedPrefab = 0; }
+        { exportedPrefabs = Directory.GetFiles(exportedAssets, pendingIsMap ? "*.unity" : "*.prefab", SearchOption.AllDirectories).Select(p => UnityBindings.Relative(exportedAssets, p)).OrderBy(p => p).ToArray(); selectedPrefab = 0; }
         private void DrawPending()
         {
             if (string.IsNullOrEmpty(exportedAssets)) return;
-            EditorGUILayout.HelpBox("Choose the crate's root prefab from the export. All of its referenced assets will be included.", MessageType.Warning);
+            EditorGUILayout.HelpBox("Choose the crate's root scene/prefab from the export. Referenced assets and explicitly packed level chunks will be included.", MessageType.Warning);
             if (exportedPrefabs == null) RefreshPrefabChoices();
-            if (exportedPrefabs.Length == 0) { EditorGUILayout.HelpBox("No prefabs were recovered. The mod may contain levels only or missing bundles.", MessageType.Error); return; }
-            selectedPrefab = EditorGUILayout.Popup("Root prefab", Mathf.Clamp(selectedPrefab, 0, exportedPrefabs.Length - 1), exportedPrefabs);
-            if (GUILayout.Button("Import chosen prefab and dependencies"))
+            if (exportedPrefabs.Length == 0) { EditorGUILayout.HelpBox("No matching root assets were recovered. Verify that the source contains every bundle for this crate.", MessageType.Error); return; }
+            selectedPrefab = EditorGUILayout.Popup(pendingIsMap ? "Root scene" : "Root prefab", Mathf.Clamp(selectedPrefab, 0, exportedPrefabs.Length - 1), exportedPrefabs);
+            if (GUILayout.Button("Import chosen root and dependencies"))
             {
                 var assets = exportedAssets; var target = pendingDestination; var root = exportedPrefabs[selectedPrefab];
-                Run(token => Import(assets, target, root, pendingWholeMod, token));
+                var extra = pendingAdditionalRoots.ToList(); var warnings = pendingWarnings.ToList();
+                Run(token => Import(assets, target, root, pendingWholeMod, token, extra, warnings));
             }
         }
     }

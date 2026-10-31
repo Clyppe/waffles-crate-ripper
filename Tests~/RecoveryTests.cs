@@ -38,6 +38,174 @@ namespace Waffles.CrateRipper.Tests
             tests.Add(new KeyValuePair<string, Action>("Bundle staging rejects missing inputs and overwrites", BundleDestinationSafety));
             tests.Add(new KeyValuePair<string, Action>("Canceled bundle staging removes only its temporary output", BundleCancellation));
             tests.Add(new KeyValuePair<string, Action>("Pallet folder lookup preserves platform alternatives and zero-crate dependencies", PalletFolderCandidates));
+            tests.Add(new KeyValuePair<string, Action>("Referenced spawn policies reconnect without exported script source", SpawnPolicyWithoutSource));
+            tests.Add(new KeyValuePair<string, Action>("VFX spawn policies preserve inherited and VFX settings", VfxSpawnPolicy));
+            tests.Add(new KeyValuePair<string, Action>("Policy schema recovery refuses custom types and attached components", PolicyIdentitySafety));
+            tests.Add(new KeyValuePair<string, Action>("Policy identity recovery refuses inconsistent documents sharing a script GUID", ConflictingPolicyIdentity));
+            tests.Add(new KeyValuePair<string, Action>("Missing spawn policy dependencies are reported rather than fabricated", MissingSpawnPolicy));
+            tests.Add(new KeyValuePair<string, Action>("Missing SDK policy type retains data and reports the exact unresolved script", MissingPolicySdk));
+            tests.Add(new KeyValuePair<string, Action>("Selected maps recover explicit chunk scenes and policy dependencies only", SelectedMapRoots));
+            tests.Add(new KeyValuePair<string, Action>("Additional selected roots reject traversal without partial imports", AdditionalRootSafety));
+        }
+
+        private const string PolicyGuid = "99999999999999999999999999999999";
+
+        private static string PolicyYaml(bool vfx = false, string identity = "", long gameObject = 0, string extra = "")
+        {
+            return "%YAML 1.1\n--- !u!114 &11400000\nMonoBehaviour:\n" +
+                "  m_GameObject: {fileID: " + gameObject + "}\n" +
+                "  m_Script: {fileID: 11500000, guid: " + ScriptGuid + ", type: 3}\n" +
+                "  m_Name: Fixture policy\n  m_EditorClassIdentifier: " + identity + "\n" +
+                "  groupByCrate: 1\n  maxSize: 23\n  mode: 2\n  skipDisable: 1\n" +
+                (vfx ? "  spawnFrequency: 0.125\n  spawnDistance: 0.4\n  spawnStackDistance: 0.2\n  spawnStackCount: 7\n" : "") + extra;
+        }
+
+        private static string BuildPolicyAssets(Fixture fixture, string policy)
+        {
+            fixture.Asset("export/Assets/Prefabs/Selected.prefab", PrefabGuid,
+                "%YAML 1.1\n--- !u!114 &200\nMonoBehaviour:\n  policyData: {fileID: 11400000, guid: " + PolicyGuid + ", type: 2}\n");
+            fixture.Asset("export/Assets/Policies/Selected policy.asset", PolicyGuid, policy);
+            fixture.Asset("export/Assets/Policies/Unrelated policy.asset", UnrelatedGuid, PolicyYaml());
+            return fixture.PathFor("export/Assets");
+        }
+
+        private static Dictionary<string, ScriptBinding> PolicyScripts()
+        {
+            return new Dictionary<string, ScriptBinding> {
+                ["SLZ.Marrow.Data.SpawnPolicyData"] = new ScriptBinding { FullTypeName = "SLZ.Marrow.Data.SpawnPolicyData", Guid = InstalledScriptGuid, FileId = 11500000 },
+                ["SLZ.Marrow.Data.VFXSpawnPolicyData"] = new ScriptBinding { FullTypeName = "SLZ.Marrow.Data.VFXSpawnPolicyData", Guid = InstalledShaderGuid, FileId = 11500000 }
+            };
+        }
+
+        private static void SpawnPolicyWithoutSource()
+        {
+            using (var fixture = new Fixture("policy-no-source"))
+            {
+                var source = BuildPolicyAssets(fixture, PolicyYaml());
+                var report = ImportInProject(fixture, source, "Assets/Policies", "Prefabs/Selected.prefab", false, PolicyScripts());
+                var root = ImportedRoot(fixture, "Policies");
+                var policy = OnlyAsset(root, "Selected policy.asset");
+                var text = File.ReadAllText(policy);
+                Check.True(text.Contains("guid: " + InstalledScriptGuid), "A policy must bind to the installed SDK ScriptableObject even without C# or an editor identity.");
+                Check.True(text.Contains("  groupByCrate: 1\n  maxSize: 23\n  mode: 2\n  skipDisable: 1\n"), "All original pooling settings must survive exactly.");
+                Check.True(File.ReadAllText(OnlyAsset(root, "Selected.prefab")).Contains("guid: " + MetaGuid(policy)), "Prefab policy references must point to the recovered policy's new GUID.");
+                Check.Equal(1, report.spawnPolicies.Count, "The report must identify the recovered policy.");
+                Check.Equal(0, report.missingScripts.Count, "Recovered SDK policy bindings must not remain missing.");
+                Check.True(!Directory.GetFiles(root, "Unrelated policy.asset", SearchOption.AllDirectories).Any(), "Policy recovery must stay inside the selected dependency closure.");
+            }
+        }
+
+        private static void VfxSpawnPolicy()
+        {
+            using (var fixture = new Fixture("vfx-policy"))
+            {
+                var source = BuildPolicyAssets(fixture, PolicyYaml(true));
+                var report = ImportInProject(fixture, source, "Assets/VFX", "Prefabs/Selected.prefab", false, PolicyScripts());
+                var text = File.ReadAllText(OnlyAsset(ImportedRoot(fixture, "VFX"), "Selected policy.asset"));
+                Check.True(text.Contains("guid: " + InstalledShaderGuid), "The VFX subclass must not be downgraded to the base policy.");
+                Check.True(text.Contains("spawnFrequency: 0.125\n  spawnDistance: 0.4\n  spawnStackDistance: 0.2\n  spawnStackCount: 7"), "VFX policy settings must be copied unchanged.");
+                Check.Equal(1, report.repairedScriptReferences, "Only the linked policy requires a script repair.");
+            }
+        }
+
+        private static void PolicyIdentitySafety()
+        {
+            foreach (var yaml in new[] { PolicyYaml(false, "CustomAssembly::Custom.MyPolicy"), PolicyYaml(false, "", 100), PolicyYaml(false, "", 0, "  customSetting: 88\n"), PolicyYaml(false, "", 0, "  spawnFrequency: 2\n") })
+            using (var fixture = new Fixture("policy-safety"))
+            {
+                var source = BuildPolicyAssets(fixture, yaml);
+                var report = ImportInProject(fixture, source, "Assets/Safe", "Prefabs/Selected.prefab", false, PolicyScripts());
+                var text = File.ReadAllText(OnlyAsset(ImportedRoot(fixture, "Safe"), "Selected policy.asset"));
+                Check.True(text.Contains("guid: " + ScriptGuid), "Unknown custom policy data must not be silently relabeled as a built-in type.");
+                Check.Equal(0, report.spawnPolicies.Count, "Unknown policy shapes must not be claimed as restored.");
+                Check.Equal(1, report.missingScripts.Count, "The unresolved script must remain visible in the report.");
+            }
+        }
+
+        private static void MissingSpawnPolicy()
+        {
+            using (var fixture = new Fixture("policy-missing"))
+            {
+                var source = BuildPolicyAssets(fixture, PolicyYaml());
+                File.Delete(fixture.PathFor("export/Assets/Policies/Selected policy.asset"));
+                File.Delete(fixture.PathFor("export/Assets/Policies/Selected policy.asset.meta"));
+                var report = ImportInProject(fixture, source, "Assets/Missing", "Prefabs/Selected.prefab", false, PolicyScripts());
+                Check.Equal(1, report.missingSpawnPolicies.Count, "The exact missing policy dependency must be distinguished from missing scripts.");
+                Check.True(report.missingSpawnPolicies[0].Contains(PolicyGuid), "Missing policies must retain their original GUID for diagnosis.");
+                Check.Equal(0, report.spawnPolicies.Count, "No replacement pooling settings should be invented.");
+            }
+        }
+
+        private static void ConflictingPolicyIdentity()
+        {
+            using (var fixture = new Fixture("policy-conflicting-evidence"))
+            {
+                var source = BuildPolicyAssets(fixture, PolicyYaml());
+                File.AppendAllText(fixture.PathFor("export/Assets/Prefabs/Selected.prefab"), "  customAsset: {fileID: 11400000, guid: " + MaterialGuid + ", type: 2}\n");
+                fixture.Asset("export/Assets/Policies/Custom policy.asset", MaterialGuid, PolicyYaml(false, "", 0, "  customFlag: 4\n"));
+                var report = ImportInProject(fixture, source, "Assets/Conflicting", "Prefabs/Selected.prefab", false, PolicyScripts());
+                Check.Equal(0, report.spawnPolicies.Count, "A familiar field subset must not override evidence of a custom script sharing the GUID.");
+                Check.Equal(0, report.repairedScriptReferences, "Ambiguous identities must not be rebound to the SDK.");
+                Check.Equal(2, report.missingScripts.Count, "Both unresolved assets should remain visible for manual inspection.");
+            }
+        }
+
+        private static void MissingPolicySdk()
+        {
+            using (var fixture = new Fixture("policy-sdk-missing"))
+            {
+                var source = BuildPolicyAssets(fixture, PolicyYaml());
+                var report = ImportInProject(fixture, source, "Assets/NoSdk", "Prefabs/Selected.prefab", false, null);
+                var text = File.ReadAllText(OnlyAsset(ImportedRoot(fixture, "NoSdk"), "Selected policy.asset"));
+                Check.True(text.Contains("maxSize: 23"), "Missing SDK support must not discard original policy fields.");
+                Check.True(report.missingScripts.Single().Contains("SLZ.Marrow.Data.SpawnPolicyData"), "The exact dependency type should be reported so it can be installed.");
+            }
+        }
+
+        private static void SelectedMapRoots()
+        {
+            using (var fixture = new Fixture("selected-map-roots"))
+            {
+                fixture.Asset("export/Assets/Scenes/Main.unity", PrefabGuid, "%YAML 1.1\n--- !u!1 &100\nGameObject:\n  m_Name: Main\n");
+                fixture.Asset("export/Assets/Scenes/Chunk.unity", MaterialGuid, "%YAML 1.1\n--- !u!114 &200\nMonoBehaviour:\n  policyData: {fileID: 11400000, guid: " + PolicyGuid + ", type: 2}\n");
+                fixture.Asset("export/Assets/Scenes/Other.unity", UnrelatedGuid, "%YAML 1.1\n--- !u!1 &100\nGameObject:\n  m_Name: Unrelated\n");
+                fixture.Asset("export/Assets/Policies/Chunk policy.asset", PolicyGuid, PolicyYaml());
+                var project = fixture.PathFor("project");
+                Directory.CreateDirectory(Path.Combine(project, "Assets"));
+                var previous = Directory.GetCurrentDirectory();
+                RecoveryReport report;
+                try
+                {
+                    Directory.SetCurrentDirectory(project);
+                    report = RecoveryPipeline.Import(fixture.PathFor("export/Assets"), "Assets/Map", "Scenes/Main.unity", false, PolicyScripts(),
+                        null, CancellationToken.None, new[] { "Scenes/Chunk.unity" });
+                }
+                finally { Directory.SetCurrentDirectory(previous); }
+                var output = ImportedRoot(fixture, "Map");
+                Check.Equal(2, report.scenes.Count, "Level main and explicitly linked chunk scenes must both be imported.");
+                Check.True(!File.Exists(Path.Combine(output, "Scenes/Other.unity")), "Additional map roots must not pull in unrelated scenes.");
+                Check.Equal(1, report.spawnPolicies.Count, "A chunk scene's nested policy dependencies must be traversed.");
+                Check.True(File.ReadAllText(Path.Combine(output, "Scenes/Chunk.unity")).Contains("guid: " + MetaGuid(OnlyAsset(output, "Chunk policy.asset"))), "Chunk scene references must follow remapped policy GUIDs.");
+            }
+        }
+
+        private static void AdditionalRootSafety()
+        {
+            using (var fixture = new Fixture("additional-root-safety"))
+            {
+                var source = BuildPolicyAssets(fixture, PolicyYaml());
+                var project = fixture.PathFor("project");
+                Directory.CreateDirectory(Path.Combine(project, "Assets"));
+                var previous = Directory.GetCurrentDirectory();
+                try
+                {
+                    Directory.SetCurrentDirectory(project);
+                    Check.Throws<ArgumentException>(() => RecoveryPipeline.Import(source, "Assets/Unsafe", "Prefabs/Selected.prefab", false,
+                        PolicyScripts(), null, CancellationToken.None, new[] { "../outside.unity" }), "Every supplemental root must remain inside the export.");
+                    Check.True(!Directory.Exists("Assets/Unsafe"), "Invalid extra roots must not leave a partial import.");
+                }
+                finally { Directory.SetCurrentDirectory(previous); }
+            }
         }
 
         private static string BuildAssets(Fixture fixture)

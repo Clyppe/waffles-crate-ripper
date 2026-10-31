@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using File = Waffles.CrateRipper.LongPathFile;
+using Directory = Waffles.CrateRipper.LongPathDirectory;
 using System.IO.Compression;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -9,6 +11,16 @@ using Newtonsoft.Json.Linq;
 
 namespace Waffles.CrateRipper
 {
+    [Serializable]
+    public sealed class CrateAssetEntry
+    {
+        public string Guid;
+        public string OriginalAssetPath;
+        public string LocalAssetPath;
+    }
+
+    public enum CrateKindFilter { All, Spawnables, Maps, Avatars }
+
     [Serializable]
     public sealed class CrateEntry
     {
@@ -22,6 +34,7 @@ namespace Waffles.CrateRipper
         public string SourceRoot;
         public string OriginalAssetPath;
         public string LocalPrefabPath;
+        public List<CrateAssetEntry> AdditionalAssets = new List<CrateAssetEntry>();
         public override string ToString() { return Name + " (" + PalletName + ")"; }
     }
 
@@ -66,12 +79,88 @@ namespace Waffles.CrateRipper
                         Kind = kind, MainAssetGuid = (string)crate["mainAsset"] ?? "",
                         PalletName = (string)pallet["title"] ?? Path.GetFileName(Path.GetDirectoryName(path)),
                         PalletBarcode = (string)pallet["barcode"] ?? "",
-                        SourceFolder = Path.GetDirectoryName(path), SourceRoot = Path.GetFullPath(folder)
+                        SourceFolder = Path.GetDirectoryName(path), SourceRoot = Path.GetFullPath(folder),
+                        AdditionalAssets = ReadPackedAssets(crate)
                     });
                 }
             }
             return result.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase).ToList();
         }
+
+        private static List<CrateAssetEntry> ReadPackedAssets(JToken crate)
+        {
+            var guids = new List<string>();
+            foreach (var packed in crate["packedAssets"] as JArray ?? new JArray())
+            {
+                var guid = (string)packed["guid"];
+                if (!string.IsNullOrEmpty(guid)) guids.Add(guid);
+                foreach (var subAsset in packed["subAssets"] as JArray ?? new JArray())
+                {
+                    var subGuid = subAsset.Type == JTokenType.String ? (string)subAsset : (string)subAsset["guid"];
+                    if (!string.IsNullOrEmpty(subGuid)) guids.Add(subGuid);
+                }
+            }
+            var mainGuid = (string)crate["mainAsset"];
+            return guids.Where(g => Regex.IsMatch(g, "^[0-9a-fA-F]{32}$") && !string.Equals(g, mainGuid, StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase).Select(g => new CrateAssetEntry { Guid = g }).ToList();
+        }
+
+        public static bool IsMap(CrateEntry crate)
+        { return (crate?.Kind ?? "").IndexOf("level", StringComparison.OrdinalIgnoreCase) >= 0; }
+
+        public static bool MatchesKind(CrateEntry crate, CrateKindFilter filter)
+        {
+            var kind = crate?.Kind ?? "";
+            switch (filter)
+            {
+                case CrateKindFilter.Maps: return IsMap(crate);
+                case CrateKindFilter.Avatars: return kind.IndexOf("avatar", StringComparison.OrdinalIgnoreCase) >= 0;
+                case CrateKindFilter.Spawnables: return kind.IndexOf("spawnable", StringComparison.OrdinalIgnoreCase) >= 0;
+                default: return true;
+            }
+        }
+
+        // Catalog roots retain their asset type. A level's similarly named prefab
+        // is never substituted for its actual scene, nor is a prop substituted for an avatar.
+        public static string MatchMainAsset(string exportedAssets, CrateEntry crate)
+        {
+            if (crate == null) throw new ArgumentNullException(nameof(crate));
+            return MatchExportedAsset(exportedAssets, crate.MainAssetGuid, crate.OriginalAssetPath,
+                IsMap(crate) ? ".unity" : ".prefab", crate.Name);
+        }
+
+        public static string MatchExportedAsset(string exportedAssets, string guid, string originalAssetPath,
+            string extension = null, string fallbackName = null)
+        {
+            exportedAssets = Path.GetFullPath(exportedAssets);
+            var candidates = Directory.GetFiles(exportedAssets, "*", SearchOption.AllDirectories)
+                .Where(p => !p.EndsWith(".meta", StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrEmpty(extension) || Path.GetExtension(p).Equals(extension, StringComparison.OrdinalIgnoreCase))).ToArray();
+            if (!string.IsNullOrEmpty(guid))
+            {
+                var exactGuid = candidates.Where(p => File.Exists(p + ".meta") &&
+                    Regex.IsMatch(File.ReadAllText(p + ".meta"), @"(?m)^guid:\s*" + Regex.Escape(guid) + @"\s*$", RegexOptions.IgnoreCase)).ToArray();
+                if (exactGuid.Length == 1) return ExportRelative(exportedAssets, exactGuid[0]);
+            }
+            if (!string.IsNullOrEmpty(originalAssetPath))
+            {
+                var original = originalAssetPath.Replace('\\', '/');
+                if (original.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)) original = original.Substring(7);
+                var exact = candidates.Where(p => ExportRelative(exportedAssets, p).Equals(original, StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (exact.Length == 1) return ExportRelative(exportedAssets, exact[0]);
+                var named = candidates.Where(p => Path.GetFileName(p).Equals(Path.GetFileName(original), StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (named.Length == 1) return ExportRelative(exportedAssets, named[0]);
+            }
+            if (!string.IsNullOrEmpty(fallbackName))
+            {
+                var named = candidates.Where(p => Path.GetFileNameWithoutExtension(p).Equals(fallbackName, StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (named.Length == 1) return ExportRelative(exportedAssets, named[0]);
+            }
+            return null;
+        }
+
+        private static string ExportRelative(string root, string path)
+        { return path.Substring(Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Length + 1).Replace('\\', '/'); }
 
         public static string FolderName(string name)
         {
@@ -88,7 +177,7 @@ namespace Waffles.CrateRipper
             var root = Path.GetFullPath(emptyDestination);
             if (Directory.Exists(root) && Directory.EnumerateFileSystemEntries(root).Any())
                 throw new IOException("ZIP staging folder must be empty.");
-            using (var archive = ZipFile.OpenRead(zipPath))
+            using (var archive = ZipFile.OpenRead(LongPathIO.ForIO(zipPath)))
             {
                 if (archive.Entries.Count > maximumEntries) throw new InvalidDataException("ZIP has too many entries.");
                 long total = 0;
@@ -136,7 +225,7 @@ namespace Waffles.CrateRipper
                     Directory.CreateDirectory(Path.GetDirectoryName(path));
                     progress?.Report("Unpacking " + name);
                     using (var input = entry.Open())
-                    using (var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write))
+                    using (var output = new FileStream(LongPathIO.ForIO(path), FileMode.CreateNew, FileAccess.Write))
                     {
                         long written = 0;
                         int read;

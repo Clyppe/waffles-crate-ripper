@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using File = Waffles.CrateRipper.LongPathFile;
+using Directory = Waffles.CrateRipper.LongPathDirectory;
 using System.IO.Compression;
 using System.Linq;
 using System.Net;
@@ -156,7 +158,7 @@ namespace Waffles.CrateRipper
                     response.EnsureSuccessStatusCode();
                     long? total = response.Content.Headers.ContentLength;
                     using (var source = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
-                    using (var destination = new FileStream(temporaryArchive, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+                    using (var destination = new FileStream(LongPathIO.ForIO(temporaryArchive), FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
                     {
                         var buffer = new byte[81920];
                         long completed = 0;
@@ -185,7 +187,7 @@ namespace Waffles.CrateRipper
                     throw new IOException("The AssetRipper download failed SHA-256 verification. The executable was not installed.");
                 progress?.Report("Verified official release. Installing AssetRipper...");
                 Directory.CreateDirectory(temporaryExtract);
-                using (var archive = ZipFile.OpenRead(temporaryArchive))
+                using (var archive = ZipFile.OpenRead(LongPathIO.ForIO(temporaryArchive)))
                 {
                     if (archive.Entries.Count > 1000 || archive.Entries.Sum(entry => entry.Length) > 2L * 1024 * 1024 * 1024)
                         throw new IOException("The backend archive exceeds the supported installation limits.");
@@ -198,7 +200,7 @@ namespace Waffles.CrateRipper
                             throw new IOException("The backend archive contains an invalid path.");
                         if (string.IsNullOrEmpty(entry.Name)) { Directory.CreateDirectory(destination); continue; }
                         Directory.CreateDirectory(Path.GetDirectoryName(destination));
-                        entry.ExtractToFile(destination);
+                        entry.ExtractToFile(LongPathIO.ForIO(destination));
                     }
                 }
                 if (!File.Exists(Path.Combine(temporaryExtract, "AssetRipper.GUI.Free.exe")))

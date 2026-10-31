@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 — 2026-10-30
+
+- Recover individual BONELAB and modded map scenes and avatars, with explicit crate type filtering.
+- Resolve explicitly packed support assets, persistent scenes and level chunks alongside the selected root, without whole-game extraction.
+- Restore static-batched map geometry as compact local-space mesh assets so objects and saved prefabs move correctly. Add repair for existing imports.
+- Recover source-free SDK spawn policy identities conservatively, preserve pooling settings and report missing policies.
+- Validate recovered scenes as well as prefabs.
+- Preserve the locally installed 1.0.4 Windows long-path fixes for deeply nested exports.
+
 ## 1.0.3 — 2026-10-03
 
 - Fix selected-crate extraction failing when required bundles share a filename, including Backlot's two `polymer.bundle` files. Preserve both bundles and their own sidecars in separate staging folders.

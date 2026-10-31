@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using File = Waffles.CrateRipper.LongPathFile;
+using Directory = Waffles.CrateRipper.LongPathDirectory;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -62,11 +64,12 @@ namespace Waffles.CrateRipper
 
         public static RecoveryReport Import(string exportedAssetsFolder, string destinationAssetFolder,
             string selectedPrefabRelativePath, bool wholeMod, IDictionary<string, ScriptBinding> installedScripts,
-            IDictionary<string, ShaderBinding> installedShaders = null, CancellationToken cancellation = default(CancellationToken))
+            IDictionary<string, ShaderBinding> installedShaders = null, CancellationToken cancellation = default(CancellationToken),
+            IEnumerable<string> additionalSelectedAssetPaths = null)
         {
             cancellation.ThrowIfCancellationRequested();
             if (string.IsNullOrWhiteSpace(exportedAssetsFolder)) throw new ArgumentException("An exported Assets folder is required.");
-            var sourceRoot = Path.GetFullPath(exportedAssetsFolder).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var sourceRoot = Path.GetFullPath(LongPathIO.Logical(exportedAssetsFolder)).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             if (!Directory.Exists(sourceRoot)) throw new DirectoryNotFoundException(sourceRoot);
             var destinationRelative = ValidateDestination(destinationAssetFolder);
             var destinationRoot = Path.GetFullPath(destinationRelative);
@@ -115,7 +118,9 @@ namespace Waffles.CrateRipper
                 }
             }
 
-            var chosen = SelectAssets(assets, byPath, byGuid, selectedPrefabRelativePath, wholeMod, report, cancellation);
+            var chosen = SelectAssets(assets, byPath, byGuid, selectedPrefabRelativePath, wholeMod, report, cancellation, additionalSelectedAssetPaths);
+            RecoverPolicyTypeIdentities(chosen.ToList(), scriptTypes, report, cancellation);
+            ReportSpawnPolicies(chosen, byGuid, scriptTypes, report, cancellation);
             var sourceFolder = ReservedFolder("_RecoveredSource", assets);
             var quarantineFolder = ReservedFolder("_QuarantinedAssets", assets);
             var freshGuids = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -211,12 +216,16 @@ namespace Waffles.CrateRipper
                     }
                     if (string.Equals(Path.GetExtension(asset.Relative), ".prefab", StringComparison.OrdinalIgnoreCase))
                         report.prefabs.Add(report.outputFolder + "/" + asset.Relative);
+                    if (string.Equals(Path.GetExtension(asset.Relative), ".unity", StringComparison.OrdinalIgnoreCase))
+                        report.scenes.Add(report.outputFolder + "/" + asset.Relative);
                     if (!string.IsNullOrEmpty(asset.ShaderName))
                         AddUnique(report.warnings, "Exported shader retained: " + asset.ShaderName + ". Compiled shaders do not contain their original authoring source; an AssetRipper placeholder may need replacement.");
                 }
 
                 report.missingScripts.Sort(StringComparer.Ordinal);
                 report.missingAssetReferences.Sort(StringComparer.Ordinal);
+                report.spawnPolicies.Sort(StringComparer.Ordinal);
+                report.missingSpawnPolicies.Sort(StringComparer.Ordinal);
                 report.warnings.Sort(StringComparer.Ordinal);
                 WriteText(Path.Combine(temporary, "recovery-report.json"), JsonConvert.SerializeObject(report, Formatting.Indented) + "\n", new UTF8Encoding(false));
                 WriteText(Path.Combine(temporary, "RECOVERY-README.txt"), Readme(report, sourceFolder, quarantineFolder), new UTF8Encoding(false));
@@ -306,18 +315,117 @@ namespace Waffles.CrateRipper
             asset.Guid = match.Groups[1].Value.ToLowerInvariant();
         }
 
+        private static bool IsSpawnPolicyType(string type)
+        {
+            return type == "SLZ.Marrow.Data.SpawnPolicyData" || type == "SLZ.Marrow.Data.VFXSpawnPolicyData";
+        }
+
+        private static void RecoverPolicyTypeIdentities(List<SourceAsset> assets, Dictionary<string, string> types,
+            RecoveryReport report, CancellationToken cancellation)
+        {
+            // A bundle can retain a policy's fields but omit the original MonoScript
+            // source/identity. Only the complete, exact SDK data shape is eligible:
+            // never replace a known custom type or a component attached to a GameObject.
+            var candidates = new Dictionary<string, KeyValuePair<string, string>>(StringComparer.OrdinalIgnoreCase);
+            var incompatible = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var asset in assets)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                if (asset.Text == null || !IsYaml(asset.Text.Value)) continue;
+                foreach (var block in SplitDocuments(asset.Text.Value))
+                {
+                    var script = ScriptField.Match(block);
+                    var guid = script.Success ? GuidField.Match(script.Value) : Match.Empty;
+                    if (!guid.Success || types.ContainsKey(guid.Groups[1].Value)) continue;
+                    var type = string.Equals(Path.GetExtension(asset.Relative), ".asset", StringComparison.OrdinalIgnoreCase)
+                        ? PolicySchemaType(block) : null;
+                    KeyValuePair<string, string> previous;
+                    if (type == null || (candidates.TryGetValue(guid.Groups[1].Value, out previous) && previous.Key != type))
+                        incompatible.Add(guid.Groups[1].Value);
+                    else candidates[guid.Groups[1].Value] = new KeyValuePair<string, string>(type, asset.Relative);
+                }
+            }
+            foreach (var candidate in candidates.Where(pair => !incompatible.Contains(pair.Key)))
+            {
+                types[candidate.Key] = candidate.Value.Key;
+                AddUnique(report.warnings, "Recovered missing spawn policy script identity from the complete SDK field schema: " + candidate.Value.Key + " — " + candidate.Value.Value + ". Original policy settings are preserved.");
+            }
+        }
+
+        private static string PolicySchemaType(string block)
+        {
+            var identity = ClassIdentifier.Match(block);
+            if (identity.Success && NormalizeTypeIdentifier(identity.Groups[1].Value).Length != 0) return null;
+            if (!Regex.IsMatch(block, @"(?m)^MonoBehaviour:[ \t]*\r?$")) return null;
+            if (!Regex.IsMatch(block, @"(?m)^  m_GameObject:[ \t]*\{[ \t]*fileID:[ \t]*0[ \t]*\}[ \t]*\r?$")) return null;
+            if (!Regex.IsMatch(block, @"(?m)^  groupByCrate:[ \t]*[01][ \t]*\r?$") ||
+                !Regex.IsMatch(block, @"(?m)^  maxSize:[ \t]*-?\d+[ \t]*\r?$") ||
+                !Regex.IsMatch(block, @"(?m)^  mode:[ \t]*[0-3][ \t]*\r?$") ||
+                !Regex.IsMatch(block, @"(?m)^  skipDisable:[ \t]*[01][ \t]*\r?$")) return null;
+            var fields = new HashSet<string>(Regex.Matches(block, @"(?m)^  ([A-Za-z_]\w*):")
+                .Cast<Match>().Select(m => m.Groups[1].Value), StringComparer.Ordinal);
+            var allowed = new HashSet<string>(new[] { "m_ObjectHideFlags", "m_CorrespondingSourceObject", "m_PrefabInstance", "m_PrefabAsset",
+                "m_GameObject", "m_Enabled", "m_EditorHideFlags", "m_Script", "m_Name", "m_EditorClassIdentifier",
+                "groupByCrate", "maxSize", "mode", "skipDisable" }, StringComparer.Ordinal);
+            var vfxFields = new[] { "spawnFrequency", "spawnDistance", "spawnStackDistance", "spawnStackCount" };
+            var vfx = vfxFields.All(fields.Contains);
+            if (vfx)
+            {
+                allowed.UnionWith(vfxFields);
+                foreach (var field in vfxFields.Take(3))
+                    if (!Regex.IsMatch(block, @"(?m)^  " + field + @":[ \t]*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?[ \t]*\r?$")) return null;
+                if (!Regex.IsMatch(block, @"(?m)^  spawnStackCount:[ \t]*-?\d+[ \t]*\r?$")) return null;
+            }
+            if (fields.Any(field => !allowed.Contains(field))) return null;
+            return "SLZ.Marrow.Data." + (vfx ? "VFXSpawnPolicyData" : "SpawnPolicyData");
+        }
+
+        private static void ReportSpawnPolicies(HashSet<SourceAsset> chosen, Dictionary<string, SourceAsset> byGuid,
+            Dictionary<string, string> types, RecoveryReport report, CancellationToken cancellation)
+        {
+            foreach (var asset in chosen)
+            {
+                cancellation.ThrowIfCancellationRequested();
+                if (asset.Text == null || !IsYaml(asset.Text.Value)) continue;
+                foreach (Match script in ScriptField.Matches(asset.Text.Value))
+                {
+                    var guid = GuidField.Match(script.Value);
+                    string type;
+                    if (guid.Success && types.TryGetValue(guid.Groups[1].Value, out type) && IsSpawnPolicyType(type))
+                        AddUnique(report.spawnPolicies, report.outputFolder + "/" + asset.Relative);
+                }
+                foreach (Match reference in Regex.Matches(asset.Text.Value, @"\b(?:policyData|_policyData|spawnPolicyData|_spawnPolicyData)[ \t]*:[ \t]*\{[^{}]*\}"))
+                {
+                    var fileId = FileIdField.Match(reference.Value);
+                    var guid = GuidField.Match(reference.Value);
+                    // A zero reference is an intentional default, not a lost asset.
+                    if (!guid.Success || !fileId.Success || fileId.Groups[1].Value == "0") continue;
+                    SourceAsset policy;
+                    if (!byGuid.TryGetValue(guid.Groups[1].Value, out policy) || policy.IsBinarySerialized)
+                        AddUnique(report.missingSpawnPolicies, guid.Groups[1].Value.ToLowerInvariant() + " — " + asset.Relative);
+                }
+            }
+            if (report.missingSpawnPolicies.Count != 0)
+                AddUnique(report.warnings, report.missingSpawnPolicies.Count + " referenced spawn policies are absent or not readable in this export. Supply their dependency bundles and retry; defaults were not invented. See missingSpawnPolicies in recovery-report.json.");
+        }
+
         private static HashSet<SourceAsset> SelectAssets(List<SourceAsset> all, Dictionary<string, SourceAsset> byPath,
-            Dictionary<string, SourceAsset> byGuid, string selected, bool wholeMod, RecoveryReport report, CancellationToken cancellation)
+            Dictionary<string, SourceAsset> byGuid, string selected, bool wholeMod, RecoveryReport report, CancellationToken cancellation,
+            IEnumerable<string> additionalSelectedAssetPaths)
         {
             if (wholeMod) return new HashSet<SourceAsset>(all);
-            if (string.IsNullOrWhiteSpace(selected) || Path.IsPathRooted(selected)) throw new ArgumentException("Choose a prefab inside the exported Assets folder.");
-            selected = Slash(selected).TrimStart('/');
-            if (selected.Split('/').Any(p => p == ".." || p == "." || p.Length == 0)) throw new ArgumentException("The selected prefab path contains invalid traversal segments.");
-            SourceAsset first;
-            if (!byPath.TryGetValue(selected, out first) || first.IsFolder) throw new FileNotFoundException("The selected prefab does not exist in the export.", selected);
             var chosen = new HashSet<SourceAsset>();
             var queue = new Queue<SourceAsset>();
-            queue.Enqueue(first);
+            foreach (var root in new[] { selected }.Concat(additionalSelectedAssetPaths ?? Enumerable.Empty<string>()))
+            {
+                cancellation.ThrowIfCancellationRequested();
+                if (string.IsNullOrWhiteSpace(root) || Path.IsPathRooted(root)) throw new ArgumentException("Choose an asset inside the exported Assets folder.");
+                var normalized = Slash(root).TrimStart('/');
+                if (normalized.Split('/').Any(p => p == ".." || p == "." || p.Length == 0)) throw new ArgumentException("The selected asset path contains invalid traversal segments.");
+                SourceAsset first;
+                if (!byPath.TryGetValue(normalized, out first) || first.IsFolder) throw new FileNotFoundException("A selected asset does not exist in the export.", normalized);
+                queue.Enqueue(first);
+            }
             while (queue.Count != 0)
             {
                 cancellation.ThrowIfCancellationRequested();
@@ -751,9 +859,12 @@ namespace Waffles.CrateRipper
                 "Output: " + report.outputFolder + "\n" +
                 "Recovered files: " + report.copiedFiles + "\n" +
                 "Reconnected script references: " + report.repairedScriptReferences + "\n" +
+                "Recovered scenes: " + report.scenes.Count + "\n" +
+                "Retained spawn policy assets: " + report.spawnPolicies.Count + "\n" +
                 "Reused installed shaders: " + report.reusedShaders + "\n\n" +
                 "See recovery-report.json for the exact files and unresolved components. Imported asset GUIDs are new; installed SDK script and shader GUIDs remain their real project GUIDs. Prefab fields and object file IDs are preserved.\n\n" +
                 "Recovered C#, managed assemblies, native libraries and assembly definitions are stored as .txt files in " + sourceFolder + ". They are reference material, not working implementations. Install the matching SDK or original dependency to resolve missing components. No replacement behaviour is invented.\n\n" +
+                "Spawn policies retain their original pooling and VFX settings. Missing script identities can be recovered only from the complete SDK policy field schema; unknown custom fields remain unresolved. See spawnPolicies, missingSpawnPolicies and missingScripts in recovery-report.json. A missing dependency is reported rather than replaced with invented policy defaults.\n\n" +
                 "Binary serialized Unity assets and bundles are preserved in " + quarantineFolder + " rather than imported with corrupt GUID references. Export them as Unity YAML with AssetRipper before retrying. Image, mesh interchange, audio and binary resource payloads remain in their original export formats.\n\n" +
                 "A compiled shader cannot supply its original source. Exact-name installed shaders are reused; other exported shader files may be placeholders that require the original source.\n";
         }
